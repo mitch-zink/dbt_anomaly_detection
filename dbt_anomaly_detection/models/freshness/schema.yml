@@ -1,0 +1,135 @@
+version: 2
+
+models:
+  - name: freshness_metrics_history
+    description: |
+      Incremental snapshot of freshness metrics for all tables in the database.
+      This model captures when tables were last altered to detect data staleness.
+
+      **Key Features:**
+      - Periodic snapshots from snap_monitored_table_metadata
+      - Tracks LAST_ALTERED timestamps from INFORMATION_SCHEMA
+      - Calculates staleness (hours/minutes since last update)
+      - Rolling 28-day baseline statistics for anomaly detection
+      - Idempotent - can be re-run without duplicating data
+      - **Supports --full-refresh**: Can be rebuilt during development/tuning without affecting snapshot history
+
+      **Use Cases:**
+      - Feed freshness anomaly detection algorithm
+      - Monitor data pipeline delays
+      - Detect stale incremental models
+      - Track table update patterns
+
+    config:
+      materialized: incremental
+      unique_key: metric_id
+
+    columns:
+      - name: metric_id
+        description: Unique identifier for this metric snapshot (surrogate key)
+        tests:
+          - not_null
+          - unique
+
+      - name: database_name
+        description: Database/catalog name
+        tests:
+          - not_null
+
+      - name: schema_name
+        description: Schema name
+        tests:
+          - not_null
+
+      - name: table_name
+        description: Table name
+        tests:
+          - not_null
+
+      - name: full_table_name
+        description: Fully qualified table name (database.schema.table)
+        tests:
+          - not_null
+
+      - name: table_last_altered_at
+        description: When the table was last altered/updated
+        tests:
+          - not_null
+
+      - name: hours_since_last_update
+        description: Hours since the table was last updated (staleness metric)
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: minutes_since_last_update
+        description: Minutes since the table was last updated (finer granularity)
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: snapshot_timestamp
+        description: Exact timestamp when snapshot was taken
+        tests:
+          - not_null
+
+      - name: source_type
+        description: |
+          Source of the metric data:
+          - 'table': Direct table query using custom timestamp column
+          - 'metadata': Information schema LAST_ALTERED metadata
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['table', 'metadata']
+
+      - name: timestamp_column
+        description: |
+          Name of the timestamp column used for direct table queries.
+          NULL for metadata-sourced metrics.
+
+      - name: _loaded_at
+        description: ETL load timestamp
+        tests:
+          - not_null
+
+      - name: expected_staleness_mean
+        description: |
+          Rolling average staleness (hours) over the last 28 days.
+          Calculated using time-based window (works at any run frequency).
+          NULL when observation_count < 7.
+
+      - name: expected_staleness_stddev
+        description: |
+          Rolling standard deviation of staleness over the last 28 days.
+          Used to calculate anomaly thresholds.
+          NULL when observation_count < 7.
+
+      - name: observation_count
+        description: |
+          Number of historical observations used in rolling window calculation.
+          Minimum of 7 required for anomaly detection.
+
+      - name: expected_max_hours
+        description: |
+          Maximum expected staleness threshold calculated as:
+          expected_staleness_mean + (3σ × expected_staleness_stddev)
+
+          Uses very_low sensitivity (3 standard deviations) by default.
+          When current staleness exceeds this, table is flagged as stale.
+
+      - name: is_stale
+        description: |
+          **ANOMALY DETECTION FLAG**
+
+          Boolean indicating if the table is currently stale (fresher than expected).
+
+          Calculation logic:
+          - false: observation_count < 7 (insufficient data)
+          - false: expected_staleness_stddev = 0 or NULL (no variation)
+          - true: hours_since_last_update > expected_max_hours
+          - false: otherwise (table is fresh)
+
+          Tests read this column to determine pass/fail.

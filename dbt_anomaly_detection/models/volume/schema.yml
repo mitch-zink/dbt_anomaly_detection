@@ -1,0 +1,187 @@
+version: 2
+
+sources:
+  - name: snowflake_information_schema
+    description: Snowflake system information schema tables
+    database: "{{ target.database }}"
+    schema: information_schema
+    tables:
+      - name: tables
+        description: Metadata about all tables in the database
+        columns:
+          - name: table_catalog
+            description: Database name
+          - name: table_schema
+            description: Schema name
+          - name: table_name
+            description: Table name
+          - name: row_count
+            description: Approximate row count
+          - name: bytes
+            description: Size in bytes
+          - name: created
+            description: Table creation timestamp
+          - name: last_altered
+            description: Last modification timestamp
+
+models:
+  - name: volume_metrics_history
+    description: |
+      Incremental snapshot of volume metrics for enrolled tables.
+      This model captures row counts to detect volume anomalies.
+
+      **Key Features:**
+      - Dual-source architecture: table queries + information_schema
+      - Instant backfilling: custom timestamp columns provide 30 days of historical data
+      - Rolling window statistics: 28-day baseline for anomaly detection
+      - Idempotent - can be re-run without duplicating data
+      - **Supports --full-refresh**: Can be rebuilt during development/tuning without affecting snapshot history
+
+      **Use Cases:**
+      - Feed volume anomaly detection algorithm
+      - Monitor table growth patterns
+      - Detect sudden spikes or drops in data volume
+      - Track data pipeline health
+
+    config:
+      materialized: incremental
+      unique_key: metric_id
+
+    columns:
+      - name: metric_id
+        description: Unique identifier for this metric snapshot (surrogate key)
+        tests:
+          - not_null
+          - unique
+
+      - name: database_name
+        description: Database/catalog name
+        tests:
+          - not_null
+
+      - name: schema_name
+        description: Schema name
+        tests:
+          - not_null
+
+      - name: table_name
+        description: Table name
+        tests:
+          - not_null
+
+      - name: full_table_name
+        description: Fully qualified table name (database.schema.table)
+        tests:
+          - not_null
+
+      - name: row_count
+        description: Number of rows in the table at snapshot time
+        tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+
+      - name: snapshot_timestamp
+        description: Exact timestamp when snapshot was taken
+        tests:
+          - not_null
+
+      - name: source_type
+        description: |
+          Source of the metric data:
+          - 'table': Direct table query using custom timestamp column
+          - 'metadata': Information schema row_count metadata
+        tests:
+          - not_null
+          - accepted_values:
+              values: ['table', 'metadata']
+
+      - name: timestamp_column
+        description: |
+          Name of the timestamp column used for direct table queries.
+          NULL for metadata-sourced metrics.
+
+      - name: _loaded_at
+        description: ETL load timestamp
+        tests:
+          - not_null
+
+      - name: expected_row_count_mean
+        description: |
+          Rolling average row count over the last 28 days.
+          Calculated using time-based window (works at any run frequency).
+          NULL when observation_count < 7.
+
+      - name: expected_row_count_stddev
+        description: |
+          Rolling standard deviation of row count over the last 28 days.
+          Used to calculate anomaly thresholds.
+          NULL when observation_count < 7.
+
+      - name: observation_count
+        description: |
+          Number of historical observations used in rolling window calculation.
+          Minimum of 7 required for anomaly detection.
+
+      - name: expected_row_count_min
+        description: |
+          Minimum expected row count threshold calculated as:
+          expected_row_count_mean - (σ × expected_row_count_stddev)
+
+          Where σ (sigma_multiplier) varies by sensitivity level (very_low=25σ, low=15σ, medium=8σ, high=4σ, very_high=2.5σ).
+
+      - name: expected_row_count_max
+        description: |
+          Maximum expected row count threshold calculated as:
+          expected_row_count_mean + (σ × expected_row_count_stddev)
+
+          Where σ (sigma_multiplier) varies by sensitivity level (very_low=25σ, low=15σ, medium=8σ, high=4σ, very_high=2.5σ).
+
+      - name: is_spike_high
+        description: |
+          Change-based anomaly flag: Row count change exceeded upper threshold AND passed materiality filter.
+          Materiality requires: >1,000 rows deviation AND >200% relative change.
+
+      - name: is_drop_low
+        description: |
+          Change-based anomaly flag: Row count change fell below lower threshold AND passed materiality filter.
+          Materiality requires: >1,000 rows deviation AND >200% relative change.
+
+      - name: is_row_count_anomaly
+        description: |
+          Size-based anomaly flag: Absolute row count out of expected range AND passed materiality filter.
+          Materiality requires: >100 rows deviation AND >5% relative change.
+
+      - name: is_anomaly
+        description: |
+          **MASTER ANOMALY FLAG**
+
+          TRUE if ANY of the detection flags (is_spike_high, is_drop_low, is_row_count_anomaly) is TRUE.
+
+          Detection combines:
+          1. Statistical significance (sigma-based thresholds)
+          2. Materiality filters (absolute + relative thresholds)
+
+          Tests read this column to determine pass/fail.
+
+      - name: row_count_change_anomaly_reason
+        description: |
+          Human-readable reason for change-based anomalies:
+          - 'Row Count Change - Spike': Growth rate significantly exceeded expected
+          - 'Row Count Change - Dip': Growth rate significantly below expected
+          - NULL: No change-based anomaly detected
+
+      - name: row_count_anomaly_reason
+        description: |
+          Human-readable reason for size-based anomalies:
+          - 'Row Count - Spike': Absolute row count significantly above expected
+          - 'Row Count - Dip': Absolute row count significantly below expected
+          - NULL: No size-based anomaly detected
+
+      - name: anomaly_reason
+        description: |
+          Combined anomaly reason (comma-separated if multiple types detected).
+          Examples:
+          - 'Row Count Change - Spike'
+          - 'Row Count - Dip'
+          - 'Row Count Change - Spike, Row Count - Spike'

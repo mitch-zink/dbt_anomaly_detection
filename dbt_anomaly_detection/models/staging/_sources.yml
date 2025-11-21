@@ -1,0 +1,20 @@
+version: 2
+
+sources:
+  - name: snapshots
+    description: Snapshot tables containing historical metadata
+    database: "{{ target.database }}"
+    schema: dbt_anomaly_detection
+    tables:
+      - name: snap_monitored_table_metadata
+        description: |
+          Snapshot of table metadata from INFORMATION_SCHEMA.TABLES for monitored tables.
+
+          This snapshot is the data collection layer for anomaly detection, capturing:
+          - row_count: For volume anomaly detection
+          - last_altered: For freshness anomaly detection
+
+          Only tracks tables enrolled via volume_anomaly or freshness_anomaly tests.
+
+          Architecture: Queries each database's INFORMATION_SCHEMA.TABLES (not account_usage)
+          Benefits: Real-time data, standard permissions, decouples collection from analysis

@@ -1,0 +1,53 @@
+version: 2
+
+models:
+  - name: stg_monitored_tables
+    description: |
+      **Enrollment Registry** - Tables enrolled in anomaly detection via volume_anomaly or freshness_anomaly tests.
+
+      **Purpose:**
+      - Scans `graph.nodes` at compile time to extract tables with anomaly detection tests
+      - Serves as the enrollment list for `snap_monitored_table_metadata` snapshot
+      - Used by metrics models to determine which tables to monitor
+
+      **How it works:**
+      1. Iterates through all test nodes in graph.nodes
+      2. Filters to tests with name = 'volume_anomaly' or 'freshness_anomaly'
+      3. Extracts the target model/source from test dependencies
+      4. Deduplicates (a table can have both volume and freshness tests)
+
+      **Note:** This includes both BASE TABLEs and VIEWs. The snapshot will filter to BASE TABLEs only.
+
+      **Build frequency:** Should be run before snapshot on every dbt run to capture newly enrolled tables.
+
+      **Full-refresh protected**: Ignores --full-refresh to prevent disruption (rarely needs rebuild).
+      Override only if needed: --vars '{allow_full_refresh_anomaly_detection: true}'
+
+    config:
+      tags: ['anomaly_detection', 'metadata']
+      materialized: table
+
+    columns:
+      - name: database_name
+        description: Database name
+        tests:
+          - not_null
+
+      - name: schema_name
+        description: Schema name
+        tests:
+          - not_null
+
+      - name: table_name
+        description: Table name
+        tests:
+          - not_null
+
+      - name: full_table_name
+        description: Fully qualified table name (database.schema.table)
+        tests:
+          - not_null
+          - unique
+
+      - name: _loaded_at
+        description: Timestamp when this record was loaded

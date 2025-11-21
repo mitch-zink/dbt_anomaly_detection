@@ -1,0 +1,211 @@
+version: 2
+
+snapshots:
+  - name: snap_monitored_table_metadata
+    description: |
+      Snapshot of table metadata from INFORMATION_SCHEMA.TABLES for monitored tables.
+
+      **Architecture**:
+      - Queries each database's INFORMATION_SCHEMA.TABLES (not account_usage)
+      - Only tracks tables enrolled via volume_anomaly or freshness_anomaly tests
+      - Enrollment determined by stg_monitored_tables model
+      - Runs with `dbt build --select snap_monitored_table_metadata` (any frequency)
+      - Uses SELECT * EXCLUDE to auto-sync with schema changes
+
+      **Benefits**:
+      - Real-time data (no 45min-3hr lag like account_usage)
+      - Standard permissions (no ACCOUNTADMIN required)
+      - Separates data collection from analysis
+      - Future-proof column capture
+
+      **Serves as source for**:
+      - Volume metrics (row_count changes over time)
+      - Freshness metrics (last_altered tracking)
+      - Table lifecycle analysis
+
+      **Hard-Coded Database References**:
+      This snapshot uses {{ db }}.INFORMATION_SCHEMA.TABLES which is a necessary
+      exception to dbt's "no hard-coded references" principle. Database names are
+      extracted from dbt's graph (node.database) at compile time, ensuring environment
+      consistency. See inline comments in snapshot SQL for full justification.
+
+      **Full-refresh protected**: Ignores --full-refresh by default to prevent loss of Type 2 SCD history.
+      (Override: --vars '{allow_full_refresh_anomaly_detection: true}')
+
+    config:
+      target_schema: dbt_anomaly_detection
+      unique_key: table_id
+      strategy: timestamp
+      updated_at: last_altered
+      invalidate_hard_deletes: true
+
+    columns:
+      - name: table_id
+        description: |
+          Unique identifier for snapshot tracking (surrogate key).
+          Generated from: md5(table_catalog || table_schema || table_name)
+        tests:
+          - not_null
+          - unique:
+              where: "dbt_valid_to is null"
+
+      - name: table_catalog
+        description: Database/catalog name
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+
+      - name: table_schema
+        description: Schema name
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+
+      - name: table_name
+        description: Table name (BASE TABLEs only)
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+
+      - name: table_owner
+        description: Role that owns the table
+
+      - name: table_type
+        description: Type of table (only BASE TABLEs are included)
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+          - accepted_values:
+              values: ['BASE TABLE']
+              where: "dbt_valid_to is null"
+
+      - name: is_transient
+        description: Whether the table is transient (YES/NO)
+
+      - name: clustering_key
+        description: Clustering key definition if table is clustered
+
+      - name: row_count
+        description: |
+          Approximate number of rows in the table.
+          Used for volume anomaly detection.
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+          - dbt_utils.expression_is_true:
+              expression: ">= 0"
+              where: "dbt_valid_to is null"
+
+      - name: bytes
+        description: Table size in bytes
+
+      - name: retention_time
+        description: Data retention time in days for Time Travel
+
+      - name: created
+        description: |
+          Timestamp when table was created.
+          Cast to TIMESTAMP_NTZ for snapshot compatibility.
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+
+      - name: last_altered
+        description: |
+          Timestamp when table was last altered/updated.
+          Cast to TIMESTAMP_NTZ for snapshot compatibility.
+          Used as snapshot updated_at column and for freshness anomaly detection.
+        tests:
+          - not_null:
+              where: "dbt_valid_to is null"
+
+      - name: last_ddl
+        description: Timestamp of last DDL operation
+
+      - name: last_ddl_by
+        description: User who performed last DDL operation
+
+      - name: auto_clustering_on
+        description: Whether automatic clustering is enabled (ON/OFF)
+
+      - name: comment
+        description: Table comment/description
+
+      - name: is_temporary
+        description: Whether the table is temporary (YES/NO)
+
+      - name: is_iceberg
+        description: Whether the table is an Iceberg table (YES/NO)
+
+      - name: is_dynamic
+        description: Whether the table is a dynamic table (YES/NO)
+
+      - name: self_referencing_column_name
+        description: |
+          Name of the designated "self-referencing" column, if any (used for SQL standard self-referencing tables).
+          Typically NULL in Snowflake.
+
+      - name: reference_generation
+        description: |
+          Indicates how values in the self-referencing column are generated (SYSTEM, USER, or NULL).
+          Typically NULL in Snowflake.
+
+      - name: user_defined_type_catalog
+        description: |
+          Catalog/database of the user-defined type for the table, if applicable.
+          Typically NULL in Snowflake.
+
+      - name: user_defined_type_schema
+        description: |
+          Schema of the user-defined type for the table, if applicable.
+          Typically NULL in Snowflake.
+
+      - name: user_defined_type_name
+        description: |
+          Name of the user-defined type for the table, if applicable.
+          Typically NULL in Snowflake.
+
+      - name: is_insertable_into
+        description: |
+          Indicates whether rows can be inserted into the table (YES/NO).
+          For BASE TABLEs, this is typically YES.
+
+      - name: is_typed
+        description: |
+          Indicates whether the table is a typed table (YES/NO).
+          Typically NO or NULL in Snowflake.
+
+      - name: commit_action
+        description: |
+          Action taken on commit for temporary tables (PRESERVE, DELETE, or NULL).
+          Typically NULL in Snowflake.
+
+      - name: is_immutable
+        description: |
+          Indicates whether the table is immutable (YES/NO).
+          Snowflake-specific; typically NO for standard tables.
+
+      - name: is_hybrid
+        description: |
+          Indicates whether the table is a hybrid table (YES/NO).
+          Snowflake-specific; typically NO for standard tables.
+
+      - name: dbt_valid_from
+        description: |
+          Snapshot metadata: timestamp when this version became valid.
+          Automatically added by dbt snapshot.
+        tests:
+          - not_null
+
+      - name: dbt_valid_to
+        description: |
+          Snapshot metadata: timestamp when this version became invalid.
+          NULL for current/active records.
+          Automatically added by dbt snapshot.
+
+      - name: dbt_updated_at
+        description: |
+          Snapshot metadata: value of updated_at column (last_altered).
+          Automatically added by dbt snapshot.
+        tests:
+          - not_null
