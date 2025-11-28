@@ -33,13 +33,23 @@ vars:
     lookback_days: 28
     # Default minimum historical observations required
     min_historical_observations: 7
-    # Sensitivity thresholds (percentage change from baseline)
-    # Calibrated from wide (quiet) to narrow (noisy) tolerance
-    sensitivity_very_low: 6.0    # ±6% tolerance - wide, only real problems (RECOMMENDED DEFAULT)
-    sensitivity_low: 4.0         # ±4% tolerance - catches significant issues
-    sensitivity_medium: 2.5      # ±2.5% tolerance - balanced middle ground
-    sensitivity_high: 1.5        # ±1.5% tolerance - catches smaller deviations
-    sensitivity_very_high: 0.5   # ±0.5% tolerance - narrow, extremely sensitive, very noisy
+
+    # # Row Count CHANGE sensitivity (growth rate detection - more volatile)
+    # # Calibrated from wide (quiet) to narrow (noisy) tolerance
+    # row_count_change_sensitivity_very_low: 32.0   # 32σ threshold - extremely wide, only catastrophic issues (RECOMMENDED DEFAULT)
+    # row_count_change_sensitivity_low: 16.0        # 16σ threshold - catches significant growth changes
+    # row_count_change_sensitivity_medium: 8.0      # 8σ threshold - balanced middle ground
+    # row_count_change_sensitivity_high: 6.0        # 6σ threshold - catches smaller deviations
+    # row_count_change_sensitivity_very_high: 4.0   # 4σ threshold - narrow, very noisy
+
+    # # Absolute ROW COUNT sensitivity (total size detection - more stable)
+    # # Calibrated from wide (quiet) to narrow (noisy) tolerance
+    # row_count_sensitivity_very_low: 6.0     # 6σ threshold - very wide, only major issues (RECOMMENDED DEFAULT)
+    # row_count_sensitivity_low: 4.0          # 4σ threshold - catches significant size changes
+    # row_count_sensitivity_medium: 3.0       # 3σ threshold - balanced middle ground
+    # row_count_sensitivity_high: 2.0         # 2σ threshold - catches smaller deviations
+    # row_count_sensitivity_very_high: 1.0    # 1σ threshold - narrow, very noisy
+
     # Enable/disable volume monitoring globally
     enabled: true
 
@@ -51,13 +61,18 @@ vars:
     min_historical_observations: 7
     # Sensitivity thresholds (sigma/standard deviations from mean)
     # Calibrated from wide (quiet) to narrow (noisy) tolerance
-    sensitivity_very_low: 3.0    # 3σ threshold - wide, rare alerts (RECOMMENDED DEFAULT)
-    sensitivity_low: 2.5         # 2.5σ threshold - catches significant staleness
-    sensitivity_medium: 2.0      # 2σ threshold - balanced middle ground
-    sensitivity_high: 1.5        # 1.5σ threshold - catches smaller staleness
-    sensitivity_very_high: 1.0   # 1σ threshold - narrow, very noisy
+    sensitivity_very_low: 2.0    # 2σ threshold - wide, rare alerts (RECOMMENDED DEFAULT)
+    sensitivity_low: 1.5         # 1.5σ threshold - catches significant staleness
+    sensitivity_medium: 1.0      # 1σ threshold - balanced middle ground
+    sensitivity_high: 0.75       # 0.75σ threshold - catches smaller staleness
+    sensitivity_very_high: 0.5   # 0.5σ threshold - narrow, very noisy
     # Enable/disable freshness monitoring globally
     enabled: true
+
+snapshots:
+  dbt_anomaly_detection:
+    +target_schema: "{{ 'dbt_anomaly_detection' if not target.name.startswith('dev_') else target.schema }}"
+    +tags: ["anomaly_detection", "snapshot"]
 
 models:
   dbt_anomaly_detection:

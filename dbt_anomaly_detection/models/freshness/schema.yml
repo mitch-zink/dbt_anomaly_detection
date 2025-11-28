@@ -8,17 +8,25 @@ models:
 
       **Key Features:**
       - Periodic snapshots from snap_monitored_table_metadata
-      - Tracks LAST_ALTERED timestamps from INFORMATION_SCHEMA
+      - Tracks LAST_ALTERED and CREATED timestamps from INFORMATION_SCHEMA
       - Calculates staleness (hours/minutes since last update)
       - Rolling 28-day baseline statistics for anomaly detection
+      - **Frequency-agnostic**: Reads ALL historical snapshot records (not just current), works regardless of run frequency
+      - **Intelligent alert filtering**: Prevents false positives with configurable minimum thresholds
       - Idempotent - can be re-run without duplicating data
       - **Supports --full-refresh**: Can be rebuilt during development/tuning without affecting snapshot history
+
+      **False Positive Prevention:**
+      - Minimum staleness threshold (6 hours default) filters normal refresh lag
+      - Minimum stddev threshold (1 hour default) filters perfectly consistent tables
+      - Requires minimum observations (7 default) for statistical significance
 
       **Use Cases:**
       - Feed freshness anomaly detection algorithm
       - Monitor data pipeline delays
       - Detect stale incremental models
       - Track table update patterns
+      - Detect CREATE OR REPLACE operations via table_created_at
 
     config:
       materialized: incremental
@@ -50,6 +58,12 @@ models:
         description: Fully qualified table name (database.schema.table)
         tests:
           - not_null
+
+      - name: table_created_at
+        description: |
+          When the table was created from INFORMATION_SCHEMA.
+          Changes when table is dropped and recreated (CREATE OR REPLACE).
+          NULL for tables using custom timestamp columns (not available from direct table queries).
 
       - name: table_last_altered_at
         description: When the table was last altered/updated
@@ -112,24 +126,45 @@ models:
           Number of historical observations used in rolling window calculation.
           Minimum of 7 required for anomaly detection.
 
+      - name: expected_min_hours
+        description: |
+          Minimum expected staleness threshold calculated as:
+          expected_staleness_mean - (σ × expected_staleness_stddev)
+
+          Where σ (sigma_multiplier) varies by sensitivity level:
+          - very_low: 25σ (recommended for production)
+          - low: 15σ
+          - medium: 8σ
+          - high: 4σ
+          - very_high: 2.5σ
+
+          When current staleness is below this, table is flagged as unusually fresh (potential issue).
+
       - name: expected_max_hours
         description: |
           Maximum expected staleness threshold calculated as:
-          expected_staleness_mean + (3σ × expected_staleness_stddev)
+          expected_staleness_mean + (σ × expected_staleness_stddev)
 
-          Uses very_low sensitivity (3 standard deviations) by default.
+          Where σ (sigma_multiplier) varies by sensitivity level:
+          - very_low: 25σ (recommended for production)
+          - low: 15σ
+          - medium: 8σ
+          - high: 4σ
+          - very_high: 2.5σ
+
           When current staleness exceeds this, table is flagged as stale.
 
       - name: is_stale
         description: |
           **ANOMALY DETECTION FLAG**
 
-          Boolean indicating if the table is currently stale (fresher than expected).
+          Boolean indicating if the table has anomalous freshness (too stale OR too fresh).
 
           Calculation logic:
           - false: observation_count < 7 (insufficient data)
           - false: expected_staleness_stddev = 0 or NULL (no variation)
-          - true: hours_since_last_update > expected_max_hours
-          - false: otherwise (table is fresh)
+          - true: hours_since_last_update > expected_max_hours (too stale)
+          - true: hours_since_last_update < expected_min_hours (unusually fresh)
+          - false: otherwise (table freshness is normal)
 
           Tests read this column to determine pass/fail.

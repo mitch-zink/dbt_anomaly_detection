@@ -27,8 +27,13 @@ A dbt package for intelligent data quality monitoring using statistical anomaly 
 - **Data staleness monitoring** with statistical analysis
 - **Dual-mode operation**: LAST_ALTERED OR custom timestamp column (instant backfill)
 - **Rolling window statistics** (28-day baseline by default)
+- **Intelligent alert filtering** - Prevents false positives with minimum thresholds:
+  - Requires minimum staleness (6 hours by default) to filter out normal refresh lag
+  - Requires minimum variation (1 hour stddev) to detect meaningful changes
+  - Ignores tables with perfectly consistent updates (stddev = 0)
 - **Configurable sensitivity** using sigma multipliers
-- **Backtesting support** for historical analysis
+- **Frequency-agnostic** - Reads all historical snapshot records regardless of run frequency
+- **Table lifecycle tracking** - Monitors table_created_at to detect CREATE OR REPLACE operations
 
 ---
 
@@ -68,17 +73,13 @@ packages:
 
 ### Step 2: Build Package Models
 
-The package must be built in dependency order. We recommend using a tag-based approach:
+Build the entire package with a single command:
 
 ```bash
-# First run - builds initial models
-dbt build --select tag:anomaly_detection
-
-# Subsequent runs - incremental updates
-dbt build --select tag:anomaly_detection
+dbt build --select dbt_anomaly_detection
 
 # Full refresh metrics during development/tuning (snapshot remains protected)
-dbt build --select tag:anomaly_detection --full-refresh
+dbt build --select dbt_anomaly_detection --full-refresh
 ```
 
 **🔒 Snapshot Protection:**
@@ -89,31 +90,19 @@ To force snapshot refresh (rare, loses all history):
 dbt snapshot --select snap_monitored_table_metadata --vars '{allow_full_refresh_anomaly_detection: true}'
 ```
 
-**Or build in order manually:**
-
-```bash
-# 1. Build enrollment registry (required first)
-dbt run --select stg_monitored_tables
-
-# 2. Build metadata snapshot (depends on stg_monitored_tables)
-dbt build --select snap_monitored_table_metadata
-
-# 3. Build metrics models (depend on snapshot)
-dbt build --select volume_metrics_history freshness_metrics_history
-```
-
 **What happens:**
-1. `stg_monitored_tables` scans your project for tables with `volume_anomaly` or `freshness_anomaly` tests
-2. `snap_monitored_table_metadata` captures metadata from `INFORMATION_SCHEMA.TABLES` for enrolled tables only
+1. `stg_monitored_tables` scans your project for **models AND sources** with `volume_anomaly` or `freshness_anomaly` tests (supports cross-database monitoring)
+2. `snap_monitored_table_metadata` captures metadata from `INFORMATION_SCHEMA.TABLES` across all databases for enrolled tables only
 3. Metrics models calculate rolling statistics and detect anomalies
 
 ### Step 3: Enroll Tables for Monitoring
 
-The package provides generic tests `volume_anomaly` and `freshness_anomaly` that you can apply to your models.
+The package provides generic tests `volume_anomaly` and `freshness_anomaly` that you can apply to **both models AND sources** (cross-database monitoring supported).
 
 **Configure tests in your `schema.yml`:**
 
 ```yaml
+# Monitor dbt models
 models:
   - name: fct_events
     tests:
@@ -136,6 +125,18 @@ models:
       - freshness_anomaly:
           sensitivity: medium
           timestamp_column: updated_at
+
+# Monitor source tables (external databases)
+sources:
+  - name: fivetran_salesforce
+    database: FIVETRAN_SALESFORCE_DB
+    tables:
+      - name: account
+        tests:
+          - volume_anomaly:
+              sensitivity: very_low
+          - freshness_anomaly:
+              sensitivity: very_low
 ```
 
 ### Step 4: Query Anomalies
@@ -242,9 +243,15 @@ Monitors data **staleness** (time since last update):
 2. **Calculate Staleness**:
    - `hours_since_last_update = datediff('hour', table_last_altered_at, snapshot_timestamp)`
    - `minutes_since_last_update` also available for finer granularity
-3. **Rolling Statistics**: Mean and stddev of staleness over 28 days (time-based window)
-4. **Detection Rule** (upper bound only):
-   - **Stale**: `hours_since_last_update > (expected_staleness_mean + σ × expected_staleness_stddev)`
+3. **Rolling Statistics**: Mean and stddev of staleness over 28 days (time-based window) - reads ALL historical snapshot records (frequency-agnostic)
+4. **Detection Rule** (upper bound only with intelligent filtering):
+   - **Statistical check**: `hours_since_last_update > (expected_staleness_mean + σ × expected_staleness_stddev)`
+   - **Minimum staleness filter**: Requires `hours_since_last_update >= 6` hours (configurable via `freshness_anomaly_detection.min_staleness_hours`)
+   - **Minimum variation filter**: Requires `expected_staleness_stddev >= 1.0` hour (configurable via `freshness_anomaly_detection.min_stddev_hours`)
+   - **Zero variation filter**: Ignores tables with `stddev = 0` (perfectly consistent updates)
+   - **Minimum observations**: Requires `observation_count >= 7` historical data points
+
+**Why these filters?** Prevent false positives from normal daily refresh lag (1-2 hours) and tables with perfectly consistent update schedules.
 
 **Why upper bound only?** Tables being "too fresh" isn't a problem - we only care if they're stale.
 
@@ -255,14 +262,18 @@ Monitors data **staleness** (time since last update):
 database_name             | varchar   | Database name
 table_name                | varchar   | Table name
 snapshot_timestamp        | timestamp | When the snapshot was taken
+table_created_at          | timestamp | When table was created (tracks CREATE OR REPLACE)
 table_last_altered_at     | timestamp | When table was last updated
 hours_since_last_update   | number    | Hours since last update (staleness)
 minutes_since_last_update | number    | Minutes since last update
 expected_staleness_mean   | number    | Expected staleness (28-day average)
 expected_staleness_stddev | number    | Standard deviation of staleness
+expected_min_hours        | number    | Lower threshold (mean - σ × stddev) - for reference only
 expected_max_hours        | number    | Upper threshold (mean + σ × stddev)
 observation_count         | number    | Historical observations used
 is_stale                  | boolean   | TRUE if stale, FALSE otherwise
+sensitivity               | varchar   | Sensitivity level (very_low/low/medium/high/very_high)
+sigma_multiplier          | decimal   | Sigma multiplier used for threshold calculation
 ```
 
 ---
@@ -313,7 +324,9 @@ vars:
 
   # Freshness Anomaly Detection
   freshness_anomaly_detection:
-    min_historical_observations: 7  # Minimum data points needed for baseline
+    min_historical_observations: 7    # Minimum data points needed for baseline
+    min_staleness_hours: 6            # Minimum hours stale to trigger alert (filters normal refresh lag)
+    min_stddev_hours: 1.0             # Minimum standard deviation to enable detection (filters perfectly consistent tables)
 ```
 
 ### Per-Model Configuration
@@ -506,19 +519,33 @@ dbt_anomaly_detection/
 
 ### How Enrollment Works
 
-1. **Apply tests** to models in your project's `schema.yml`:
+1. **Apply tests** to models OR sources in your project's `schema.yml`:
    ```yaml
-   - name: fct_orders
-     tests:
-       - dbt_anomaly_detection.volume_anomaly:
-           sensitivity: very_low
+   # For dbt models
+   models:
+     - name: fct_orders
+       tests:
+         - volume_anomaly:
+             sensitivity: very_low
+
+   # For source tables (cross-database)
+   sources:
+     - name: fivetran_salesforce
+       database: FIVETRAN_SALESFORCE_DB
+       tables:
+         - name: account
+           tests:
+             - volume_anomaly:
+                 sensitivity: very_low
    ```
 
-2. **`stg_monitored_tables`** scans `graph.nodes` at compile time to find all tables with `volume_anomaly` or `freshness_anomaly` tests
+2. **`stg_monitored_tables`** scans both `graph.nodes` (models) AND `graph.sources` (source tables) at compile time to find all tables with `volume_anomaly` or `freshness_anomaly` tests
 
-3. **`snap_monitored_table_metadata`** queries `INFORMATION_SCHEMA.TABLES` but only for tables in `stg_monitored_tables`
+3. **`snap_monitored_table_metadata`** dynamically queries `INFORMATION_SCHEMA.TABLES` from each database for tables in `stg_monitored_tables` (cross-database support)
 
 4. **Metrics models** join to the snapshot to calculate anomalies
+
+**Cross-Database Support:** Source tables from external databases (e.g., FIVETRAN_SALESFORCE_DB, FIVETRAN_HEAP_DB) are fully supported. The snapshot queries each database's INFORMATION_SCHEMA to retrieve metadata.
 
 **Note:** Only BASE TABLEs are tracked. VIEWs are excluded because they don't have row_count or LAST_ALTERED metadata.
 

@@ -3,12 +3,15 @@ version: 2
 snapshots:
   - name: snap_monitored_table_metadata
     description: |
-      Snapshot of table metadata from INFORMATION_SCHEMA.TABLES for monitored tables.
+      Snapshot of table metadata from INFORMATION_SCHEMA.TABLES for monitored tables and sources.
 
       **Architecture**:
-      - Queries each database's INFORMATION_SCHEMA.TABLES (not account_usage)
-      - Only tracks tables enrolled via volume_anomaly or freshness_anomaly tests
+      - Queries each database's INFORMATION_SCHEMA.TABLES dynamically (not account_usage)
+      - Supports cross-database monitoring: queries multiple databases for source tables
+      - Only tracks tables enrolled via volume_anomaly or freshness_anomaly tests (models AND sources)
       - Enrollment determined by stg_monitored_tables model
+      - **Snapshot Strategy**: check (tracks created, last_altered, snapshot_timestamp)
+      - **Creates record on EVERY run**: Ensures time-series data for frequency-agnostic detection
       - Runs with `dbt build --select snap_monitored_table_metadata` (any frequency)
       - Uses SELECT * EXCLUDE to auto-sync with schema changes
 
@@ -16,18 +19,20 @@ snapshots:
       - Real-time data (no 45min-3hr lag like account_usage)
       - Standard permissions (no ACCOUNTADMIN required)
       - Separates data collection from analysis
+      - Frequency-agnostic: Works regardless of run schedule (hourly, daily, etc.)
       - Future-proof column capture
+      - Cross-database support for external source tables
 
       **Serves as source for**:
       - Volume metrics (row_count changes over time)
-      - Freshness metrics (last_altered tracking)
-      - Table lifecycle analysis
+      - Freshness metrics (last_altered and created tracking)
+      - Table lifecycle analysis (CREATE OR REPLACE detection)
 
       **Hard-Coded Database References**:
       This snapshot uses {{ db }}.INFORMATION_SCHEMA.TABLES which is a necessary
       exception to dbt's "no hard-coded references" principle. Database names are
-      extracted from dbt's graph (node.database) at compile time, ensuring environment
-      consistency. See inline comments in snapshot SQL for full justification.
+      extracted from dbt's graph (node.database for models, source.database for sources) at compile time,
+      ensuring environment consistency. See inline comments in snapshot SQL for full justification.
 
       **Full-refresh protected**: Ignores --full-refresh by default to prevent loss of Type 2 SCD history.
       (Override: --vars '{allow_full_refresh_anomaly_detection: true}')
@@ -35,8 +40,8 @@ snapshots:
     config:
       target_schema: dbt_anomaly_detection
       unique_key: table_id
-      strategy: timestamp
-      updated_at: last_altered
+      strategy: check
+      check_cols: ["created", "last_altered", "snapshot_timestamp"]
       invalidate_hard_deletes: true
 
     columns:
@@ -106,9 +111,7 @@ snapshots:
         description: |
           Timestamp when table was created.
           Cast to TIMESTAMP_NTZ for snapshot compatibility.
-        tests:
-          - not_null:
-              where: "dbt_valid_to is null"
+          Note: May be NULL for some tables
 
       - name: last_altered
         description: |

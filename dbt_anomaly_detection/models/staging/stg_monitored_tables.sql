@@ -11,8 +11,16 @@
 /*
     Staging: Monitored Tables
 
-    Extracts the list of tables enrolled in anomaly detection by scanning graph.nodes
-    for tables with volume_anomaly or freshness_anomaly tests.
+    Extracts the list of tables and sources enrolled in anomaly detection by scanning:
+    - graph.nodes (dbt models)
+    - graph.sources (source tables from external databases)
+
+    Finds all tables with volume_anomaly or freshness_anomaly tests.
+
+    **Cross-Database Support:**
+    Fully supports source tables from external databases (e.g., FIVETRAN_SALESFORCE_DB,
+    FIVETRAN_HEAP_DB). Each source's database property is captured and used to query
+    the correct INFORMATION_SCHEMA.
 
     **Full Refresh Protection:**
     This model ignores --full-refresh flag by default to prevent accidental rebuilds.
@@ -34,7 +42,22 @@
                         {%- if dep_node_id.startswith(
                             "model."
                         ) or dep_node_id.startswith("source.") -%}
-                            {%- set ref_node = graph.nodes.get(dep_node_id) -%}
+                            {#
+                            CROSS-DATABASE SOURCE TABLE SUPPORT:
+
+                            Source tables (external databases) exist in graph.sources, NOT graph.nodes.
+                            This conditional enables monitoring of:
+                            - dbt models: accessed via graph.nodes.get()
+                            - Source tables: accessed via graph.sources.get()
+
+                            This allows anomaly detection on external databases like:
+                            FIVETRAN_SALESFORCE_DB, FIVETRAN_HEAP_DB, etc.
+                            #}
+                            {%- if dep_node_id.startswith("source.") -%}
+                                {%- set ref_node = graph.sources.get(dep_node_id) -%}
+                            {%- else -%}
+                                {%- set ref_node = graph.nodes.get(dep_node_id) -%}
+                            {%- endif -%}
                             {%- if ref_node -%}
                                 {%- set table_info = {
                                     "database": ref_node.database,
@@ -73,10 +96,10 @@
             union all
             select
         {% endif %}
-            '{{ table.database }}' as database_name,
-            '{{ table.schema }}' as schema_name,
-            '{{ table.name }}' as table_name,
-            '{{ table.full_name }}' as full_table_name,
+            '{{ table.database | upper }}' as database_name,
+            '{{ table.schema | upper }}' as schema_name,
+            '{{ table.name | upper }}' as table_name,
+            upper('{{ table.full_name }}') as full_table_name,
             current_timestamp() as _loaded_at
     {%- endfor %}
 {%- else %}

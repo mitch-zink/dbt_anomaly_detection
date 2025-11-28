@@ -3,18 +3,24 @@ version: 2
 models:
   - name: stg_monitored_tables
     description: |
-      **Enrollment Registry** - Tables enrolled in anomaly detection via volume_anomaly or freshness_anomaly tests.
+      **Enrollment Registry** - Tables and sources enrolled in anomaly detection via volume_anomaly or freshness_anomaly tests.
 
       **Purpose:**
-      - Scans `graph.nodes` at compile time to extract tables with anomaly detection tests
+      - Scans `graph.nodes` (models) AND `graph.sources` (source tables) at compile time to extract tables with anomaly detection tests
+      - Supports cross-database monitoring (e.g., FIVETRAN_SALESFORCE_DB, FIVETRAN_HEAP_DB, etc.)
       - Serves as the enrollment list for `snap_monitored_table_metadata` snapshot
       - Used by metrics models to determine which tables to monitor
 
       **How it works:**
       1. Iterates through all test nodes in graph.nodes
       2. Filters to tests with name = 'volume_anomaly' or 'freshness_anomaly'
-      3. Extracts the target model/source from test dependencies
-      4. Deduplicates (a table can have both volume and freshness tests)
+      3. Extracts the target model from dependencies, checking:
+         - `graph.sources` if dependency starts with "source."
+         - `graph.nodes` for all other dependencies (models)
+      4. Captures database, schema, and table name from the node
+      5. Deduplicates (a table can have both volume and freshness tests)
+
+      **Cross-Database Support:** Fully supports source tables from external databases. Each source's database property is used to query the correct INFORMATION_SCHEMA.
 
       **Note:** This includes both BASE TABLEs and VIEWs. The snapshot will filter to BASE TABLEs only.
 

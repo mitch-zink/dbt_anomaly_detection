@@ -7,6 +7,7 @@
     )
 }}
 
+-- depends_on: {{ ref('snap_monitored_table_metadata') }}
 /*
     Volume Metrics History - Dual Detection Architecture
 
@@ -59,7 +60,12 @@
                         {%- if dep_node_id.startswith(
                             "model."
                         ) or dep_node_id.startswith("source.") -%}
-                            {%- set ref_node = graph.nodes.get(dep_node_id) -%}
+                            {# Check graph.sources for source tables, graph.nodes for models #}
+                            {%- if dep_node_id.startswith("source.") -%}
+                                {%- set ref_node = graph.sources.get(dep_node_id) -%}
+                            {%- else -%}
+                                {%- set ref_node = graph.nodes.get(dep_node_id) -%}
+                            {%- endif -%}
                             {%- if ref_node -%}
                                 {%- set table_info = {
                                     "database": ref_node.database,
@@ -131,13 +137,40 @@
     {%- endfor -%}
 {%- endif -%}
 
--- Sensitivity to sigma multiplier mapping
-{%- set sensitivity_map = {
-    "very_low": 25.0,
-    "low": 15.0,
-    "medium": 8.0,
-    "high": 4.0,
-    "very_high": 2.5,
+-- Sensitivity to sigma multiplier mapping (read from vars in dbt_project.yml)
+-- Separate settings for row_count_change (growth rate) vs absolute row_count
+{%- set row_count_change_sensitivity_map = {
+    "very_low": var(
+        "volume_anomaly_detection.row_count_change_sensitivity_very_low",
+        20.0,
+    ),
+    "low": var(
+        "volume_anomaly_detection.row_count_change_sensitivity_low", 12.0
+    ),
+    "medium": var(
+        "volume_anomaly_detection.row_count_change_sensitivity_medium", 8.0
+    ),
+    "high": var(
+        "volume_anomaly_detection.row_count_change_sensitivity_high", 6.0
+    ),
+    "very_high": var(
+        "volume_anomaly_detection.row_count_change_sensitivity_very_high",
+        5.0,
+    ),
+} -%}
+
+{%- set row_count_sensitivity_map = {
+    "very_low": var(
+        "volume_anomaly_detection.row_count_sensitivity_very_low", 16.0
+    ),
+    "low": var("volume_anomaly_detection.row_count_sensitivity_low", 8.0),
+    "medium": var(
+        "volume_anomaly_detection.row_count_sensitivity_medium", 4.0
+    ),
+    "high": var("volume_anomaly_detection.row_count_sensitivity_high", 2.0),
+    "very_high": var(
+        "volume_anomaly_detection.row_count_sensitivity_very_high", 1.0
+    ),
 } -%}
 
 -- Query tables with custom timestamp columns (hourly granularity for backfill)
@@ -178,7 +211,10 @@ with
                     'table' as source_type,
                     '{{ table.timestamp_column }}' as timestamp_column,
                     '{{ table.sensitivity }}' as sensitivity,
-                    {{ sensitivity_map[table.sensitivity] }} as sigma_multiplier,
+                    {{ row_count_change_sensitivity_map[table.sensitivity] }}
+                    as row_count_change_sigma_multiplier,
+                    {{ row_count_sensitivity_map[table.sensitivity] }}
+                    as row_count_sigma_multiplier,
 
                     current_timestamp() as _loaded_at
 
@@ -218,7 +254,7 @@ with
                 -- Volume metric
                 t.row_count,
 
-                t.dbt_valid_from as snapshot_timestamp,  -- Use snapshot timestamp from SCD
+                t.snapshot_timestamp,  -- Hourly snapshot timestamp
                 'metadata' as source_type,
                 cast(null as varchar) as timestamp_column,
 
@@ -239,17 +275,28 @@ with
                     )
                     {%- for table in metadata_tables %}
                         when upper('{{ table.full_name }}')
-                        then {{ sensitivity_map[table.sensitivity] }}
+                        then {{ row_count_change_sensitivity_map[table.sensitivity] }}
                     {%- endfor %}
-                end as sigma_multiplier,
+                end as row_count_change_sigma_multiplier,
+
+                case
+                    upper(
+                        t.table_catalog || '.' || t.table_schema || '.' || t.table_name
+                    )
+                    {%- for table in metadata_tables %}
+                        when upper('{{ table.full_name }}')
+                        then {{ row_count_sensitivity_map[table.sensitivity] }}
+                    {%- endfor %}
+                end as row_count_sigma_multiplier,
 
                 current_timestamp() as _loaded_at
 
-            from {{ source("snapshots", "snap_monitored_table_metadata") }} t
+            from {{ ref("snap_monitored_table_metadata") }} t
             where
                 true
                 and t.table_type = 'BASE TABLE'
                 and t.row_count is not null
+                and t.snapshot_timestamp is not null
                 -- Read ALL snapshot records (including historical versions for
                 -- backfill)
                 -- Only include enrolled tables (case-insensitive comparison)
@@ -260,6 +307,18 @@ with
                         upper('{{ table.full_name }}'){% if not loop.last %},{% endif %}
                     {%- endfor %}
                 )
+            -- Deduplicate snapshot source in case of duplicate snapshot_timestamp
+            -- timestamps
+            qualify
+                row_number() over (
+                    partition by
+                        t.table_catalog,
+                        t.table_schema,
+                        t.table_name,
+                        t.snapshot_timestamp
+                    order by t.dbt_updated_at desc nulls last
+                )
+                = 1
         {%- else %}
             -- No metadata-enrolled tables, return empty result set
             select
@@ -272,7 +331,8 @@ with
                 cast(null as varchar) as source_type,
                 cast(null as varchar) as timestamp_column,
                 cast(null as varchar) as sensitivity,
-                cast(null as number) as sigma_multiplier,
+                cast(null as number) as row_count_change_sigma_multiplier,
+                cast(null as number) as row_count_sigma_multiplier,
                 cast(null as timestamp_ntz) as _loaded_at
             where false
         {%- endif %}
@@ -306,7 +366,8 @@ with
                 source_type,
                 timestamp_column,
                 sensitivity,
-                sigma_multiplier,
+                row_count_change_sigma_multiplier,
+                row_count_sigma_multiplier,
                 _loaded_at
             from {{ this }}
             where snapshot_timestamp >= dateadd('day', -30, current_timestamp())
@@ -338,7 +399,8 @@ with
             source_type,
             timestamp_column,
             sensitivity,
-            sigma_multiplier,
+            row_count_change_sigma_multiplier,
+            row_count_sigma_multiplier,
             _loaded_at,
             row_count_change,
 
@@ -411,27 +473,33 @@ with
             row_count,
             row_count_change,
 
-            -- Statistical baselines for row_count_change (unified for both sources)
+            -- Statistical baselines for row_count_CHANGE (uses
+            -- row_count_change_sigma_multiplier)
             round(expected_change_mean, 0) as expected_change_mean,
             round(expected_change_stddev, 0) as expected_change_stddev,
             round(
-                expected_change_mean - (sigma_multiplier * expected_change_stddev), 0
+                expected_change_mean
+                - (row_count_change_sigma_multiplier * expected_change_stddev),
+                0
             ) as expected_change_min,
             round(
-                expected_change_mean + (sigma_multiplier * expected_change_stddev), 0
+                expected_change_mean
+                + (row_count_change_sigma_multiplier * expected_change_stddev),
+                0
             ) as expected_change_max,
 
-            -- Statistical baselines for ABSOLUTE row_count
+            -- Statistical baselines for ABSOLUTE row_count (uses
+            -- row_count_sigma_multiplier)
             round(expected_row_count_mean, 0) as expected_row_count_mean,
             round(expected_row_count_stddev, 0) as expected_row_count_stddev,
             round(
                 expected_row_count_mean
-                - (sigma_multiplier * expected_row_count_stddev),
+                - (row_count_sigma_multiplier * expected_row_count_stddev),
                 0
             ) as expected_row_count_min,
             round(
                 expected_row_count_mean
-                + (sigma_multiplier * expected_row_count_stddev),
+                + (row_count_sigma_multiplier * expected_row_count_stddev),
                 0
             ) as expected_row_count_max,
 
@@ -446,7 +514,7 @@ with
                         metric_change="row_count_change",
                         expected_change_mean="expected_change_mean",
                         expected_change_stddev="expected_change_stddev",
-                        sigma_multiplier="sigma_multiplier",
+                        sigma_multiplier="row_count_change_sigma_multiplier",
                         observation_count="observation_count",
                         min_observations=var(
                             "volume_anomaly_detection.min_historical_observations", 7
@@ -474,7 +542,7 @@ with
                         metric_change="row_count_change",
                         expected_change_mean="expected_change_mean",
                         expected_change_stddev="expected_change_stddev",
-                        sigma_multiplier="sigma_multiplier",
+                        sigma_multiplier="row_count_change_sigma_multiplier",
                         observation_count="observation_count",
                         min_observations=var(
                             "volume_anomaly_detection.min_historical_observations", 7
@@ -509,11 +577,11 @@ with
                     (
                         row_count < (
                             expected_row_count_mean
-                            - (sigma_multiplier * expected_row_count_stddev)
+                            - (row_count_sigma_multiplier * expected_row_count_stddev)
                         )
                         or row_count > (
                             expected_row_count_mean
-                            + (sigma_multiplier * expected_row_count_stddev)
+                            + (row_count_sigma_multiplier * expected_row_count_stddev)
                         )
                     )
                     and (
@@ -569,7 +637,7 @@ with
                     metric_change="row_count_change",
                     expected_change_mean="expected_change_mean",
                     expected_change_stddev="expected_change_stddev",
-                    sigma_multiplier="sigma_multiplier",
+                    sigma_multiplier="row_count_change_sigma_multiplier",
                     observation_count="observation_count",
                     min_observations=var(
                         "volume_anomaly_detection.min_historical_observations", 7
@@ -582,7 +650,7 @@ with
                     metric_change="row_count_change",
                     expected_change_mean="expected_change_mean",
                     expected_change_stddev="expected_change_stddev",
-                    sigma_multiplier="sigma_multiplier",
+                    sigma_multiplier="row_count_change_sigma_multiplier",
                     observation_count="observation_count",
                     min_observations=var(
                         "volume_anomaly_detection.min_historical_observations", 7
@@ -598,87 +666,60 @@ with
                 and (
                     row_count < (
                         expected_row_count_mean
-                        - (sigma_multiplier * expected_row_count_stddev)
+                        - (row_count_sigma_multiplier * expected_row_count_stddev)
                     )
                     or row_count > (
                         expected_row_count_mean
-                        + (sigma_multiplier * expected_row_count_stddev)
+                        + (row_count_sigma_multiplier * expected_row_count_stddev)
                     )
                 )
             ) as is_row_count_anomaly_statistical,
 
             -- Overall anomaly flag: Statistical anomaly AND passes materiality filter
+            -- Disabled is_growth_stalled to reduce false positives
             (
-                (
-                    {{
-                        is_spike_high(
-                            metric_change="row_count_change",
-                            expected_change_mean="expected_change_mean",
-                            expected_change_stddev="expected_change_stddev",
-                            sigma_multiplier="sigma_multiplier",
-                            observation_count="observation_count",
-                            min_observations=var(
-                                "volume_anomaly_detection.min_historical_observations",
-                                7,
-                            ),
-                        )
-                    }}
-                    and abs(row_count_change - expected_change_mean) >= 1000
-                    and (
-                        case
-                            when expected_change_mean = 0
-                            then abs(row_count_change) >= 1000
-                            else
-                                abs(
-                                    (row_count_change - expected_change_mean)
-                                    / nullif(abs(expected_change_mean), 0)
-                                )
-                                >= 2.0
-                        end
+                {{
+                    is_spike_high(
+                        metric_change="row_count_change",
+                        expected_change_mean="expected_change_mean",
+                        expected_change_stddev="expected_change_stddev",
+                        sigma_multiplier="row_count_change_sigma_multiplier",
+                        observation_count="observation_count",
+                        min_observations=var(
+                            "volume_anomaly_detection.min_historical_observations", 7
+                        ),
                     )
-                )
-                or (
-                    {{
-                        is_drop_low(
-                            metric_change="row_count_change",
-                            expected_change_mean="expected_change_mean",
-                            expected_change_stddev="expected_change_stddev",
-                            sigma_multiplier="sigma_multiplier",
-                            observation_count="observation_count",
-                            min_observations=var(
-                                "volume_anomaly_detection.min_historical_observations",
-                                7,
-                            ),
-                        )
-                    }}
-                    and abs(row_count_change - expected_change_mean) >= 1000
-                    and (
-                        case
-                            when expected_change_mean = 0
-                            then abs(row_count_change) >= 1000
-                            else
-                                abs(
-                                    (row_count_change - expected_change_mean)
-                                    / nullif(abs(expected_change_mean), 0)
-                                )
-                                >= 2.0
-                        end
+                }}
+                or {{
+                    is_drop_low(
+                        metric_change="row_count_change",
+                        expected_change_mean="expected_change_mean",
+                        expected_change_stddev="expected_change_stddev",
+                        sigma_multiplier="row_count_change_sigma_multiplier",
+                        observation_count="observation_count",
+                        min_observations=var(
+                            "volume_anomaly_detection.min_historical_observations", 7
+                        ),
                     )
-                )
+                }}
                 or (
                     observation_count
-                    >=
-                    {{ var("volume_anomaly_detection.min_historical_observations", 7) }}
+                    >= {{
+                        var(
+                            "volume_anomaly_detection.min_historical_observations",
+                            7,
+                        )
+                    }}
                     and expected_row_count_stddev > 0
                     and expected_row_count_stddev is not null
                     and (
                         row_count < (
                             expected_row_count_mean
-                            - (sigma_multiplier * expected_row_count_stddev)
+                            - (row_count_sigma_multiplier * expected_row_count_stddev)
                         )
                         or row_count > (
                             expected_row_count_mean
-                            + (sigma_multiplier * expected_row_count_stddev)
+                            + (row_count_sigma_multiplier * expected_row_count_stddev)
                         )
                     )
                     and (
@@ -698,6 +739,7 @@ with
             ) as is_anomaly,
 
             -- Separate anomaly reasons for change-based detection
+            -- Disabled growth stalled detection to reduce false positives
             case
                 when
                     {{
@@ -705,7 +747,7 @@ with
                             metric_change="row_count_change",
                             expected_change_mean="expected_change_mean",
                             expected_change_stddev="expected_change_stddev",
-                            sigma_multiplier="sigma_multiplier",
+                            sigma_multiplier="row_count_change_sigma_multiplier",
                             observation_count="observation_count",
                             min_observations=var(
                                 "volume_anomaly_detection.min_historical_observations",
@@ -720,7 +762,7 @@ with
                             metric_change="row_count_change",
                             expected_change_mean="expected_change_mean",
                             expected_change_stddev="expected_change_stddev",
-                            sigma_multiplier="sigma_multiplier",
+                            sigma_multiplier="row_count_change_sigma_multiplier",
                             observation_count="observation_count",
                             min_observations=var(
                                 "volume_anomaly_detection.min_historical_observations",
@@ -747,7 +789,7 @@ with
                         and expected_row_count_stddev is not null
                         and row_count < (
                             expected_row_count_mean
-                            - (sigma_multiplier * expected_row_count_stddev)
+                            - (row_count_sigma_multiplier * expected_row_count_stddev)
                         )
                     )
                 then 'Row Count - Dip'
@@ -764,7 +806,7 @@ with
                         and expected_row_count_stddev is not null
                         and row_count > (
                             expected_row_count_mean
-                            + (sigma_multiplier * expected_row_count_stddev)
+                            + (row_count_sigma_multiplier * expected_row_count_stddev)
                         )
                     )
                 then 'Row Count - Spike'
@@ -786,7 +828,8 @@ with
 
             -- Configuration
             sensitivity,
-            sigma_multiplier,
+            row_count_change_sigma_multiplier,
+            row_count_sigma_multiplier,
 
             -- System columns
             {{
@@ -811,5 +854,5 @@ from final
 {% if is_incremental() %}
     -- On incremental runs, only return new snapshots (filter out historical data used
     -- for window calculations)
-    where snapshot_timestamp >= (select max(snapshot_timestamp) from {{ this }})
+    where snapshot_timestamp > (select max(snapshot_timestamp) from {{ this }})
 {% endif %}

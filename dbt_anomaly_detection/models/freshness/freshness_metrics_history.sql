@@ -7,6 +7,7 @@
     )
 }}
 
+-- depends_on: {{ ref('snap_monitored_table_metadata') }}
 /*
     Freshness Metrics History - Dual Source Architecture
 
@@ -48,7 +49,12 @@
                         {%- if dep_node_id.startswith(
                             "model."
                         ) or dep_node_id.startswith("source.") -%}
-                            {%- set ref_node = graph.nodes.get(dep_node_id) -%}
+                            {# Check graph.sources for source tables, graph.nodes for models #}
+                            {%- if dep_node_id.startswith("source.") -%}
+                                {%- set ref_node = graph.sources.get(dep_node_id) -%}
+                            {%- else -%}
+                                {%- set ref_node = graph.nodes.get(dep_node_id) -%}
+                            {%- endif -%}
                             {%- if ref_node -%}
                                 {%- set table_info = {
                                     "database": ref_node.database,
@@ -120,13 +126,17 @@
     {%- endfor -%}
 {%- endif -%}
 
--- Sensitivity to sigma multiplier mapping
+-- Sensitivity to sigma multiplier mapping (read from vars in dbt_project.yml)
 {%- set sensitivity_map = {
-    "very_low": 25.0,
-    "low": 15.0,
-    "medium": 8.0,
-    "high": 4.0,
-    "very_high": 2.5,
+    "very_low": var(
+        "freshness_anomaly_detection.sensitivity_very_low", 2.0
+    ),
+    "low": var("freshness_anomaly_detection.sensitivity_low", 1.5),
+    "medium": var("freshness_anomaly_detection.sensitivity_medium", 1.0),
+    "high": var("freshness_anomaly_detection.sensitivity_high", 0.75),
+    "very_high": var(
+        "freshness_anomaly_detection.sensitivity_very_high", 0.5
+    ),
 } -%}
 
 -- Generate hourly spine and query tables with custom timestamp columns
@@ -180,9 +190,15 @@ with
             filled_{{ loop.index }} as (
                 select
                     spine.snapshot_timestamp,
-                    max(data.max_timestamp) over (
-                        order by spine.snapshot_timestamp
-                        rows between unbounded preceding and current row
+                    -- Cap table_last_altered_at at snapshot_timestamp to prevent
+                    -- future timestamps
+                    -- from causing negative staleness calculations
+                    least(
+                        max(data.max_timestamp) over (
+                            order by spine.snapshot_timestamp
+                            rows between unbounded preceding and current row
+                        ),
+                        spine.snapshot_timestamp
                     ) as table_last_altered_at
                 from hourly_spine spine
                 left join
@@ -198,6 +214,7 @@ with
                     '{{ table.schema }}' as schema_name,
                     '{{ table.name }}' as table_name,
                     '{{ table.full_name }}' as full_table_name,
+                    cast(null as timestamp_ntz) as table_created_at,  -- Not available for custom timestamp tables
                     table_last_altered_at,
                     snapshot_timestamp,
                     'table' as source_type,
@@ -214,7 +231,9 @@ with
                     ) as minutes_since_last_update,
 
                     '{{ table.sensitivity }}' as sensitivity,
-                    {{ sensitivity_map[table.sensitivity] }} as sigma_multiplier,
+                    cast(
+                        {{ sensitivity_map[table.sensitivity] }} as decimal(5, 2)
+                    ) as sigma_multiplier,
 
                     current_timestamp() as _loaded_at
                 from filled_{{ loop.index }}
@@ -235,41 +254,48 @@ with
 
     {% else %}
     {%- endif %}
-    -- Query information_schema for enrolled tables (those with freshness tests but no
-    -- timestamp_column)
+    -- Query snapshot for enrolled tables (those with freshness tests but no
+    -- timestamp_column) - provides 30-day history even on full-refresh
     metadata_metrics as (
         {%- if metadata_tables | length > 0 %}
             select
                 -- Table identification
-                t.table_catalog as database_name,
-                t.table_schema as schema_name,
-                t.table_name,
-                t.table_catalog
+                snap.table_catalog as database_name,
+                snap.table_schema as schema_name,
+                snap.table_name,
+                snap.table_catalog
                 || '.'
-                || t.table_schema
+                || snap.table_schema
                 || '.'
-                || t.table_name as full_table_name,
+                || snap.table_name as full_table_name,
 
                 -- Freshness metrics
-                t.last_altered as table_last_altered_at,
+                snap.created as table_created_at,
+                -- Cap at snapshot_timestamp to prevent future timestamps from causing
+                -- negative staleness
+                least(
+                    snap.last_altered, snap.snapshot_timestamp
+                ) as table_last_altered_at,
 
-                t.dbt_valid_from as snapshot_timestamp,  -- Use snapshot timestamp from SCD
+                snap.snapshot_timestamp,
                 'metadata' as source_type,
                 cast(null as varchar) as timestamp_column,
 
-                -- Staleness metrics (calculated relative to snapshot timestamp)
+                -- Staleness metrics
                 datediff(
-                    'hour', t.last_altered, t.dbt_valid_from
+                    'hour',
+                    least(snap.last_altered, snap.snapshot_timestamp),
+                    snap.snapshot_timestamp
                 ) as hours_since_last_update,
                 datediff(
-                    'minute', t.last_altered, t.dbt_valid_from
+                    'minute',
+                    least(snap.last_altered, snap.snapshot_timestamp),
+                    snap.snapshot_timestamp
                 ) as minutes_since_last_update,
 
                 -- Sensitivity from test config
                 case
-                    upper(
-                        t.table_catalog || '.' || t.table_schema || '.' || t.table_name
-                    )
+                    upper(snap.full_table_name)
                     {%- for table in metadata_tables %}
                         when upper('{{ table.full_name }}')
                         then '{{ table.sensitivity }}'
@@ -277,9 +303,7 @@ with
                 end as sensitivity,
 
                 case
-                    upper(
-                        t.table_catalog || '.' || t.table_schema || '.' || t.table_name
-                    )
+                    upper(snap.full_table_name)
                     {%- for table in metadata_tables %}
                         when upper('{{ table.full_name }}')
                         then {{ sensitivity_map[table.sensitivity] }}
@@ -288,21 +312,42 @@ with
 
                 current_timestamp() as _loaded_at
 
-            from {{ source("snapshots", "snap_monitored_table_metadata") }} t
+            from {{ ref("snap_monitored_table_metadata") }} snap
             where
                 true
-                and t.table_type = 'BASE TABLE'
-                and t.last_altered is not null
-                -- Read ALL snapshot records (including historical versions for
-                -- backfill)
+                -- Read ALL snapshot records (including historical) for
+                -- frequency-agnostic detection
+                and snap.last_altered is not null
+                and snap.snapshot_timestamp is not null
+                {% if is_incremental() %}
+                    -- On incremental runs, only query last 30 days from snapshot
+                    and snap.snapshot_timestamp
+                    >= dateadd('day', -30, current_timestamp())
+                {% endif %}
                 -- Only include enrolled tables (case-insensitive comparison)
                 and upper(
-                    t.table_catalog || '.' || t.table_schema || '.' || t.table_name
+                    snap.table_catalog
+                    || '.'
+                    || snap.table_schema
+                    || '.'
+                    || snap.table_name
                 ) in (
                     {%- for table in metadata_tables %}
                         upper('{{ table.full_name }}'){% if not loop.last %},{% endif %}
                     {%- endfor %}
                 )
+            -- Deduplicate snapshot source in case of duplicate snapshot_timestamp
+            -- timestamps
+            qualify
+                row_number() over (
+                    partition by
+                        snap.table_catalog,
+                        snap.table_schema,
+                        snap.table_name,
+                        snap.snapshot_timestamp
+                    order by snap.dbt_updated_at desc nulls last
+                )
+                = 1
         {%- else %}
             -- No metadata-enrolled tables, return empty result set
             select
@@ -310,6 +355,7 @@ with
                 cast(null as varchar) as schema_name,
                 cast(null as varchar) as table_name,
                 cast(null as varchar) as full_table_name,
+                cast(null as timestamp_ntz) as table_created_at,
                 cast(null as timestamp_ntz) as table_last_altered_at,
                 cast(null as timestamp_ntz) as snapshot_timestamp,
                 cast(null as varchar) as source_type,
@@ -317,7 +363,7 @@ with
                 cast(null as number) as hours_since_last_update,
                 cast(null as number) as minutes_since_last_update,
                 cast(null as varchar) as sensitivity,
-                cast(null as number) as sigma_multiplier,
+                cast(null as decimal(5, 2)) as sigma_multiplier,
                 cast(null as timestamp_ntz) as _loaded_at
             where false
         {%- endif %}
@@ -346,6 +392,7 @@ with
                 schema_name,
                 table_name,
                 full_table_name,
+                table_created_at,
                 table_last_altered_at,
                 snapshot_timestamp,
                 source_type,
@@ -370,6 +417,7 @@ with
             schema_name,
             table_name,
             full_table_name,
+            table_created_at,
             table_last_altered_at,
             hours_since_last_update,
             minutes_since_last_update,
@@ -427,6 +475,7 @@ with
             snapshot_timestamp,
 
             -- Metrics
+            table_created_at,
             table_last_altered_at,
             hours_since_last_update,
             minutes_since_last_update,
@@ -436,14 +485,20 @@ with
             round(expected_staleness_stddev, 0) as expected_staleness_stddev,
             round(
                 expected_staleness_mean
+                - (sigma_multiplier * expected_staleness_stddev),
+                0
+            ) as expected_min_hours,
+            round(
+                expected_staleness_mean
                 + (sigma_multiplier * expected_staleness_stddev),
                 0
             ) as expected_max_hours,
 
             observation_count,
 
-            -- Anomaly detection flag (only upper bound matters for freshness)
+            -- Anomaly detection flag (upper bound only - too stale)
             case
+                -- Not enough historical data
                 when
                     observation_count
                     < {{
@@ -453,8 +508,21 @@ with
                         )
                     }}
                 then false
+                -- No variation in staleness (perfectly consistent updates)
                 when expected_staleness_stddev = 0 or expected_staleness_stddev is null
                 then false
+                -- Insufficient variation to detect anomalies (< 1 hour stddev)
+                when
+                    expected_staleness_stddev
+                    < {{ var("freshness_anomaly_detection.min_stddev_hours", 1.0) }}
+                then false
+                -- Below minimum absolute staleness threshold (filter out normal
+                -- refresh lag)
+                when
+                    hours_since_last_update
+                    < {{ var("freshness_anomaly_detection.min_staleness_hours", 6) }}
+                then false
+                -- Stale beyond expected upper bound
                 when
                     hours_since_last_update > (
                         expected_staleness_mean
@@ -491,5 +559,5 @@ from final
 {% if is_incremental() %}
     -- On incremental runs, only return new snapshots (filter out historical data used
     -- for window calculations)
-    where snapshot_timestamp >= (select max(snapshot_timestamp) from {{ this }})
+    where snapshot_timestamp > (select max(snapshot_timestamp) from {{ this }})
 {% endif %}

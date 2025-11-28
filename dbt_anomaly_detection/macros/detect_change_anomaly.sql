@@ -63,3 +63,33 @@
         else false
     end
 {% endmacro %}
+
+{% macro is_growth_stalled(
+    metric_change,
+    expected_change_mean,
+    observation_count,
+    min_observations=7,
+    positive_change_threshold=100
+) %}
+    {#
+    Detects if growth has stalled for tables that normally grow
+
+    Returns true if:
+    - Table historically has positive growth (expected_change_mean > positive_change_threshold)
+    - Current change is below threshold (metric_change < positive_change_threshold)
+    - Sufficient historical data (observation_count >= min_observations)
+
+    Use case: Catches when a table that normally grows +1000 rows/hour suddenly grows by only +50 rows
+    #}
+    case
+        when {{ observation_count }} < {{ min_observations }}
+        then false
+        when {{ expected_change_mean }} is null
+        then false
+        when
+            {{ expected_change_mean }} > {{ positive_change_threshold }}
+            and {{ metric_change }} < {{ positive_change_threshold }}
+        then true
+        else false
+    end
+{% endmacro %}

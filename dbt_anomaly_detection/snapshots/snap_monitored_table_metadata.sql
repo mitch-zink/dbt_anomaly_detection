@@ -4,8 +4,8 @@
         config(
             target_schema="dbt_anomaly_detection",
             unique_key="table_id",
-            strategy="timestamp",
-            updated_at="last_altered",
+            strategy="check",
+            check_cols=["created", "last_altered", "snapshot_timestamp"],
             invalidate_hard_deletes=True,
             tags=["anomaly_detection", "snapshot", "metadata"],
             full_refresh=(
@@ -19,16 +19,18 @@
     /*
     Snapshot: Monitored Table Metadata
 
-    Captures point-in-time metadata for tables enrolled in anomaly detection.
+    Captures point-in-time metadata for tables and sources enrolled in anomaly detection.
     Only tracks tables with volume_anomaly or freshness_anomaly tests (via stg_monitored_tables).
+    Supports cross-database monitoring of both dbt models and external source tables.
 
     This serves as the source-of-truth for:
     - Volume metrics (row_count changes over time)
     - Freshness metrics (last_altered tracking)
     - Table lifecycle (creation, modifications)
 
-    Architecture: Queries INFORMATION_SCHEMA.TABLES from each database (not account_usage)
-    Benefits: Real-time data, standard permissions, decouples data collection from analysis
+    Architecture: Dynamically queries INFORMATION_SCHEMA.TABLES from each database (not account_usage)
+    Cross-Database: Queries multiple databases for source tables (e.g., FIVETRAN_SALESFORCE_DB, FIVETRAN_HEAP_DB, ANALYTICS)
+    Benefits: Real-time data, standard permissions, decouples data collection from analysis, cross-database support
 
     **Full Refresh Protection:**
     This snapshot ignores --full-refresh by default to prevent loss of Type 2 SCD history.
@@ -38,23 +40,24 @@
     {#
     ENROLLMENT-BASED FILTERING
 
-    Get the list of monitored tables from stg_monitored_tables.
+    Get the list of monitored tables and sources from stg_monitored_tables.
     This model contains only tables enrolled in anomaly detection via
-    volume_anomaly or freshness_anomaly tests (extracted from graph.nodes).
+    volume_anomaly or freshness_anomaly tests (extracted from graph.nodes and graph.sources).
 
     This approach ensures:
     - Only explicitly enrolled tables are tracked (no accidental monitoring)
     - Automatic discovery of new enrollments on each dbt run
     - Centralized enrollment registry for visibility
+    - Cross-database support for external source tables
 
     Note: stg_monitored_tables must be built before this snapshot.
     #}
     {%- set monitored_tables_query -%}
         select distinct
-            upper(database_name) as database_name,
-            upper(schema_name) as schema_name,
-            upper(table_name) as table_name,
-            upper(full_table_name) as full_table_name
+            database_name,
+            schema_name,
+            table_name,
+            full_table_name
         from {{ ref('stg_monitored_tables') }}
     {%- endset -%}
 
@@ -88,27 +91,54 @@
     references" principle. This is a necessary exception for the following reasons:
 
     1. INFORMATION_SCHEMA is a Snowflake system view that cannot be referenced via dbt's ref() or source()
-    2. We must query across multiple databases dynamically (determined at compile time from graph.nodes)
-    3. The database names come from dbt's graph (node.database), ensuring environment consistency
+    2. We must query across multiple databases dynamically (determined at compile time from graph.nodes and graph.sources)
+    3. The database names come from dbt's graph (node.database for models, source.database for sources), ensuring environment consistency
     4. Alternative approaches (account_usage) have unacceptable latency (45min-3hr lag)
 
     Environment Consistency:
-    - Database names are extracted from dbt model configs (node.database)
+    - Database names are extracted from dbt configs:
+      * Models: node.database from dbt_project.yml
+      * Sources: source.database from _sources.yml files
     - Each environment (dev/prod) has its own dbt_project.yml with appropriate database mappings
-    - No manual database names are hardcoded - all come from graph.nodes
+    - No manual database names are hardcoded - all come from graph.nodes and graph.sources
+    - Enables cross-database monitoring of external source tables (e.g., FIVETRAN_SALESFORCE_DB)
 #}
             -- Query {{ db }}.INFORMATION_SCHEMA.TABLES
             select
-                -- Unique identifier for snapshot tracking
+                -- Unique identifier for snapshot tracking (case-insensitive)
                 {{
                     dbt_utils.generate_surrogate_key(
-                        ["table_catalog", "table_schema", "table_name"]
+                        [
+                            "upper(nullif(table_catalog, ''))",
+                            "upper(nullif(table_schema, ''))",
+                            "upper(nullif(table_name, ''))",
+                        ]
                     )
                 }} as table_id,
 
-                -- All columns from INFORMATION_SCHEMA.TABLES (automatically syncs
-                -- with schema changes)
-                * exclude (created, last_altered),
+                -- Snapshot timestamp (hourly grain)
+                date_trunc('hour', current_timestamp())::timestamp_ntz
+                as snapshot_timestamp,
+
+                -- Convert empty strings to NULL for data quality
+                nullif(table_catalog, '') as table_catalog,
+                nullif(table_schema, '') as table_schema,
+                nullif(table_name, '') as table_name,
+
+                -- Add explicit aliases so volume_metrics_history can reference
+                -- database_name/schema_name/full_table_name
+                nullif(table_catalog, '') as database_name,
+                nullif(table_schema, '') as schema_name,
+                nullif(table_catalog, '')
+                || '.'
+                || nullif(table_schema, '')
+                || '.'
+                || nullif(table_name, '') as full_table_name,
+
+                -- All other columns from INFORMATION_SCHEMA.TABLES
+                * exclude (
+                    table_catalog, table_schema, table_name, created, last_altered
+                ),
 
                 -- Cast timestamp columns to TIMESTAMP_NTZ for snapshot compatibility
                 created::timestamp_ntz as created,
@@ -120,10 +150,20 @@
                 -- Only BASE TABLEs (exclude VIEWs - they don't have row_count or
                 -- meaningful LAST_ALTERED)
                 table_type = 'BASE TABLE'
+                -- Exclude records with NULL or empty metadata (data quality
+                -- filter) Use NULLIF to convert empty strings to NULL before checking
+                and nullif(table_catalog, '') is not null
+                and nullif(table_schema, '') is not null
+                and nullif(table_name, '') is not null
                 -- Only snapshot tables enrolled in anomaly detection via
                 -- stg_monitored_tables
+                -- Use COALESCE to prevent empty strings from creating false matches
                 and upper(
-                    table_catalog || '.' || table_schema || '.' || table_name
+                    coalesce(nullif(table_catalog, ''), 'INVALID_DB')
+                    || '.'
+                    || coalesce(nullif(table_schema, ''), 'INVALID_SCHEMA')
+                    || '.'
+                    || coalesce(nullif(table_name, ''), 'INVALID_TABLE')
                 ) in (
                     {%- set matching_tables = [] %}
                     {%- for table in monitored_tables %}
@@ -146,6 +186,7 @@
         -- INFORMATION_SCHEMA.TABLES schema
         select
             cast(null as varchar) as table_id,
+            cast(null as timestamp_ntz) as snapshot_timestamp,
             cast(null as varchar) as table_catalog,
             cast(null as varchar) as table_schema,
             cast(null as varchar) as table_name,
