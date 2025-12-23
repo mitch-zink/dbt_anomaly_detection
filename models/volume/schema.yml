@@ -82,9 +82,7 @@ models:
               expression: ">= 0"
 
       - name: snapshot_timestamp
-        description: Exact timestamp when snapshot was taken
-        tests:
-          - not_null
+        description: Exact timestamp when snapshot was taken (may be NULL for backfilled metadata records)
 
       - name: source_type
         description: |

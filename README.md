@@ -4,7 +4,7 @@ A dbt package for intelligent data quality monitoring using statistical anomaly 
 
 > **🔷 Snowflake Only**: This package uses Snowflake-specific features (`information_schema`, `generator()`, date functions)
 
-> **Design Philosophy**: Built to prevent alert fatigue. Default sensitivity (`very_low` = 25σ) catches only catastrophic anomalies using wide statistical bounds combined with materiality filters. Detects anomalies in **growth patterns**, not just absolute values.
+> **Design Philosophy**: Built to prevent alert fatigue. Default sensitivity (`very_low`) uses wide statistical bounds combined with materiality filters. Volume detection uses 20σ/16σ for change/count-based detection, freshness uses 10σ. Detects anomalies in **growth patterns**, not just absolute values.
 
 ## Features
 
@@ -284,13 +284,33 @@ sigma_multiplier          | decimal   | Sigma multiplier used for threshold calc
 
 Control how strict the anomaly detection is using sigma multipliers.
 
-| Sensitivity  | Sigma (σ) | Expected Anomaly Rate | Use Case |
-|--------------|-----------|----------------------|----------|
-| `very_low`   | 25.0      | ~0.1%                | **Ultra-wide tolerance** - only catastrophic issues (**RECOMMENDED for production**) |
-| `low`        | 15.0      | ~0.5%                | Very wide tolerance - major anomalies only |
-| `medium`     | 8.0       | ~2%                  | Balanced sensitivity (catches significant issues) |
-| `high`       | 4.0       | ~5%                  | Tighter tolerance - more sensitive |
-| `very_high`  | 2.5       | ~10%                 | Narrow tolerance - most sensitive (will be noisy) |
+**Note:** Volume and Freshness use different sigma ranges because they measure different phenomena:
+- **Volume** (row counts) has high variance → wider sigmas needed
+- **Freshness** (staleness hours) has low variance → tighter sigmas appropriate
+
+#### Volume Sensitivity (Row Count Detection)
+
+**Note:** Volume detection uses two separate sigma settings (see dbt_project.yml):
+- `row_count_change_sensitivity_*` - For growth rate anomalies
+- `row_count_sensitivity_*` - For absolute row count anomalies
+
+| Sensitivity  | Change σ | Count σ | Use Case |
+|--------------|----------|---------|----------|
+| `very_low`   | 20.0     | 16.0    | **Wide tolerance** - catches major anomalies (**RECOMMENDED for production**) |
+| `low`        | 12.0     | 8.0     | Moderate tolerance - significant anomalies |
+| `medium`     | 8.0      | 4.0     | Balanced sensitivity |
+| `high`       | 6.0      | 2.0     | Tighter tolerance - more sensitive |
+| `very_high`  | 5.0      | 1.0     | Narrow tolerance - most sensitive (will be noisy) |
+
+#### Freshness Sensitivity (Staleness Detection)
+
+| Sensitivity  | Sigma (σ) | Typical Threshold | Use Case |
+|--------------|-----------|------------------|----------|
+| `very_low`   | 10.0      | 3-7 days         | **Forgiving** - catches abandoned tables (**RECOMMENDED for production**) |
+| `low`        | 6.0       | 2-4 days         | Moderate tolerance - tables stale days |
+| `medium`     | 4.0       | 1-3 days         | Balanced sensitivity |
+| `high`       | 2.5       | Hours to 1 day   | Strict - catches tables stale beyond normal pattern |
+| `very_high`  | 1.5       | Hours            | Very strict - will generate noise from normal variance |
 
 **How it works:**
 - **Fully dynamic** - Adapts to any table size, growth rate, and load frequency (hourly, daily, weekly, etc.)
@@ -327,6 +347,23 @@ vars:
     min_historical_observations: 7    # Minimum data points needed for baseline
     min_staleness_hours: 6            # Minimum hours stale to trigger alert (filters normal refresh lag)
     min_stddev_hours: 1.0             # Minimum standard deviation to enable detection (filters perfectly consistent tables)
+
+    # Optional: Override sigma multipliers (freshness detection defaults shown below)
+    # sensitivity_very_low: 10.0      # Forgiving tolerance (default)
+    # sensitivity_low: 6.0             # Moderate tolerance
+    # sensitivity_medium: 4.0          # Balanced sensitivity
+    # sensitivity_high: 2.5            # Tighter tolerance
+    # sensitivity_very_high: 1.5       # Narrow tolerance
+```
+
+**Example: Stricter freshness detection for your project:**
+
+```yaml
+vars:
+  freshness_anomaly_detection:
+    sensitivity_very_low: 6.0         # Override default 10.0σ to be more strict
+    sensitivity_low: 4.0              # Override default 6.0σ
+    min_staleness_hours: 2            # Alert after just 2 hours stale
 ```
 
 ### Per-Model Configuration

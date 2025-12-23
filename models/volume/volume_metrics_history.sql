@@ -2,7 +2,7 @@
     config(
         materialized="incremental",
         unique_key="metric_id",
-        on_schema_change="append_new_columns",
+        on_schema_change="sync_all_columns",
         tags=["anomaly_detection", "volume"],
     )
 }}
@@ -41,7 +41,9 @@
        - Output: 'Row Count - Spike' or 'Row Count - Dip'
 
     **Sensitivity Levels:**
-    Configurable sigma multipliers (very_low=25σ, low=15σ, medium=8σ, high=4σ, very_high=2.5σ)
+    Configurable sigma multipliers:
+    - Row Count Change: very_low=4.0σ, low=3.0σ, medium=2.0σ, high=1.5σ, very_high=1.0σ
+    - Absolute Row Count: very_low=6.0σ, low=4.0σ, medium=3.0σ, high=2.0σ, very_high=1.0σ
 
     **Output:**
     - 4 boolean flags: is_spike_high, is_drop_low, is_row_count_anomaly, is_anomaly
@@ -296,7 +298,6 @@ with
                 true
                 and t.table_type = 'BASE TABLE'
                 and t.row_count is not null
-                and t.snapshot_timestamp is not null
                 -- Read ALL snapshot records (including historical versions for
                 -- backfill)
                 -- Only include enrolled tables (case-insensitive comparison)
@@ -678,6 +679,20 @@ with
             -- Overall anomaly flag: Statistical anomaly AND passes materiality filter
             -- Disabled is_growth_stalled to reduce false positives
             (
+                {#
+                {{
+                    is_growth_stalled(
+                        metric_change="row_count_change",
+                        expected_change_mean="expected_change_mean",
+                        observation_count="observation_count",
+                        min_observations=var(
+                            "volume_anomaly_detection.min_historical_observations", 7
+                        ),
+                        positive_change_threshold=100,
+                    )
+                }}
+                or
+                #}
                 {{
                     is_spike_high(
                         metric_change="row_count_change",
@@ -739,7 +754,6 @@ with
             ) as is_anomaly,
 
             -- Separate anomaly reasons for change-based detection
-            -- Disabled growth stalled detection to reduce false positives
             case
                 when
                     {{

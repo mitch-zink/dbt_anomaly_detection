@@ -34,21 +34,21 @@ vars:
     # Default minimum historical observations required
     min_historical_observations: 7
 
-    # # Row Count CHANGE sensitivity (growth rate detection - more volatile)
-    # # Calibrated from wide (quiet) to narrow (noisy) tolerance
-    # row_count_change_sensitivity_very_low: 32.0   # 32σ threshold - extremely wide, only catastrophic issues (RECOMMENDED DEFAULT)
-    # row_count_change_sensitivity_low: 16.0        # 16σ threshold - catches significant growth changes
-    # row_count_change_sensitivity_medium: 8.0      # 8σ threshold - balanced middle ground
-    # row_count_change_sensitivity_high: 6.0        # 6σ threshold - catches smaller deviations
-    # row_count_change_sensitivity_very_high: 4.0   # 4σ threshold - narrow, very noisy
+    # Row Count CHANGE sensitivity (growth rate detection - more volatile)
+    # Calibrated from wide (quiet) to narrow (noisy) tolerance
+    row_count_change_sensitivity_very_low: 4.0    # 4σ threshold - wide, catches major growth issues (RECOMMENDED DEFAULT)
+    row_count_change_sensitivity_low: 3.0         # 3σ threshold - catches significant growth changes
+    row_count_change_sensitivity_medium: 2.0      # 2σ threshold - balanced middle ground
+    row_count_change_sensitivity_high: 1.5        # 1.5σ threshold - catches smaller deviations
+    row_count_change_sensitivity_very_high: 1.0   # 1σ threshold - narrow, very noisy
 
-    # # Absolute ROW COUNT sensitivity (total size detection - more stable)
-    # # Calibrated from wide (quiet) to narrow (noisy) tolerance
-    # row_count_sensitivity_very_low: 6.0     # 6σ threshold - very wide, only major issues (RECOMMENDED DEFAULT)
-    # row_count_sensitivity_low: 4.0          # 4σ threshold - catches significant size changes
-    # row_count_sensitivity_medium: 3.0       # 3σ threshold - balanced middle ground
-    # row_count_sensitivity_high: 2.0         # 2σ threshold - catches smaller deviations
-    # row_count_sensitivity_very_high: 1.0    # 1σ threshold - narrow, very noisy
+    # Absolute ROW COUNT sensitivity (total size detection - more stable)
+    # Calibrated from wide (quiet) to narrow (noisy) tolerance
+    row_count_sensitivity_very_low: 6.0     # 6σ threshold - very wide, only major issues (RECOMMENDED DEFAULT)
+    row_count_sensitivity_low: 4.0          # 4σ threshold - catches significant size changes
+    row_count_sensitivity_medium: 3.0       # 3σ threshold - balanced middle ground
+    row_count_sensitivity_high: 2.0         # 2σ threshold - catches smaller deviations
+    row_count_sensitivity_very_high: 1.0    # 1σ threshold - narrow, very noisy
 
     # Enable/disable volume monitoring globally
     enabled: true
@@ -77,10 +77,12 @@ snapshots:
 models:
   dbt_anomaly_detection:
     +materialized: incremental
-    +on_schema_change: "append_new_columns"
+    +on_schema_change: "sync_all_columns"
     +schema: "{{ 'dbt_anomaly_detection' if not target.name.startswith('dev_') else target.schema }}"
     # In dev: uses dev_<username> schema
     # In prod: uses dbt_anomaly_detection schema
+    # Disable dbt_constraints for this package (not compatible)
+    +dbt_constraints_enabled: false
     volume:
       +tags: ["anomaly_detection", "volume"]
     freshness:

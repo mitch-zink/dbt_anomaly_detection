@@ -109,9 +109,9 @@
                 {{
                     dbt_utils.generate_surrogate_key(
                         [
-                            "upper(nullif(table_catalog, ''))",
-                            "upper(nullif(table_schema, ''))",
-                            "upper(nullif(table_name, ''))",
+                            "upper(table_catalog)",
+                            "upper(table_schema)",
+                            "upper(table_name)",
                         ]
                     )
                 }} as table_id,
@@ -120,25 +120,9 @@
                 date_trunc('hour', current_timestamp())::timestamp_ntz
                 as snapshot_timestamp,
 
-                -- Convert empty strings to NULL for data quality
-                nullif(table_catalog, '') as table_catalog,
-                nullif(table_schema, '') as table_schema,
-                nullif(table_name, '') as table_name,
-
-                -- Add explicit aliases so volume_metrics_history can reference
-                -- database_name/schema_name/full_table_name
-                nullif(table_catalog, '') as database_name,
-                nullif(table_schema, '') as schema_name,
-                nullif(table_catalog, '')
-                || '.'
-                || nullif(table_schema, '')
-                || '.'
-                || nullif(table_name, '') as full_table_name,
-
-                -- All other columns from INFORMATION_SCHEMA.TABLES
-                * exclude (
-                    table_catalog, table_schema, table_name, created, last_altered
-                ),
+                -- All columns from INFORMATION_SCHEMA.TABLES (automatically syncs
+                -- with schema changes)
+                * exclude (created, last_altered),
 
                 -- Cast timestamp columns to TIMESTAMP_NTZ for snapshot compatibility
                 created::timestamp_ntz as created,
@@ -150,20 +134,10 @@
                 -- Only BASE TABLEs (exclude VIEWs - they don't have row_count or
                 -- meaningful LAST_ALTERED)
                 table_type = 'BASE TABLE'
-                -- Exclude records with NULL or empty metadata (data quality
-                -- filter) Use NULLIF to convert empty strings to NULL before checking
-                and nullif(table_catalog, '') is not null
-                and nullif(table_schema, '') is not null
-                and nullif(table_name, '') is not null
                 -- Only snapshot tables enrolled in anomaly detection via
                 -- stg_monitored_tables
-                -- Use COALESCE to prevent empty strings from creating false matches
                 and upper(
-                    coalesce(nullif(table_catalog, ''), 'INVALID_DB')
-                    || '.'
-                    || coalesce(nullif(table_schema, ''), 'INVALID_SCHEMA')
-                    || '.'
-                    || coalesce(nullif(table_name, ''), 'INVALID_TABLE')
+                    table_catalog || '.' || table_schema || '.' || table_name
                 ) in (
                     {%- set matching_tables = [] %}
                     {%- for table in monitored_tables %}

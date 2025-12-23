@@ -2,7 +2,7 @@
     config(
         materialized="incremental",
         unique_key="metric_id",
-        on_schema_change="append_new_columns",
+        on_schema_change="sync_all_columns",
         tags=["anomaly_detection", "freshness"],
     )
 }}
@@ -127,15 +127,20 @@
 {%- endif -%}
 
 -- Sensitivity to sigma multiplier mapping (read from vars in dbt_project.yml)
+-- Freshness uses different thresholds than volume because staleness patterns are more
+-- stable
+-- Universal defaults balanced for production use - catch abandoned tables without
+-- excessive noise
+-- Override in your project's dbt_project.yml under freshness_anomaly_detection vars
 {%- set sensitivity_map = {
     "very_low": var(
-        "freshness_anomaly_detection.sensitivity_very_low", 2.0
+        "freshness_anomaly_detection.sensitivity_very_low", 10.0
     ),
-    "low": var("freshness_anomaly_detection.sensitivity_low", 1.5),
-    "medium": var("freshness_anomaly_detection.sensitivity_medium", 1.0),
-    "high": var("freshness_anomaly_detection.sensitivity_high", 0.75),
+    "low": var("freshness_anomaly_detection.sensitivity_low", 6.0),
+    "medium": var("freshness_anomaly_detection.sensitivity_medium", 4.0),
+    "high": var("freshness_anomaly_detection.sensitivity_high", 2.5),
     "very_high": var(
-        "freshness_anomaly_detection.sensitivity_very_high", 0.5
+        "freshness_anomaly_detection.sensitivity_very_high", 1.5
     ),
 } -%}
 
@@ -382,11 +387,11 @@ with
 
     -- Include historical data for metadata mode to enable proper window function
     -- calculations
+    -- IMPORTANT: Always include historical snapshot data (even on full-refresh)
+    -- to ensure rolling window statistics have sufficient observations
     with_history as (
         {% if is_incremental() %}
-            -- On incremental runs, union new snapshots with historical data (last 30
-            -- days)
-            -- Only select base columns to match structure of unioned CTE
+            -- Incremental: Load from existing table
             select
                 database_name,
                 schema_name,
@@ -404,6 +409,58 @@ with
                 _loaded_at
             from {{ this }}
             where snapshot_timestamp >= dateadd('day', -30, current_timestamp())
+            union all
+        {% else %}
+            -- Full-refresh: Load from snapshot to preserve historical context
+            -- Without this, rolling windows would only see current run's data
+            select
+                snap.table_catalog as database_name,
+                snap.table_schema as schema_name,
+                snap.table_name,
+                snap.full_table_name,
+                snap.created as table_created_at,
+                snap.last_altered as table_last_altered_at,
+                snap.snapshot_timestamp,
+                'metadata' as source_type,
+                cast(null as varchar) as timestamp_column,
+                greatest(
+                    0, datediff('hour', snap.last_altered, snap.snapshot_timestamp)
+                ) as hours_since_last_update,
+                greatest(
+                    0, datediff('minute', snap.last_altered, snap.snapshot_timestamp)
+                ) as minutes_since_last_update,
+                -- Map sensitivity from test configuration
+                case
+                    upper(snap.full_table_name)
+                    {%- for table in metadata_tables %}
+                        when upper('{{ table.full_name }}')
+                        then '{{ table.sensitivity }}'
+                    {%- endfor %}
+                end as sensitivity,
+                -- Map sigma multiplier from sensitivity_map
+                case
+                    upper(snap.full_table_name)
+                    {%- for table in metadata_tables %}
+                        when upper('{{ table.full_name }}')
+                        then {{ sensitivity_map[table.sensitivity] }}
+                    {%- endfor %}
+                end as sigma_multiplier,
+                snap.snapshot_timestamp as _loaded_at
+            from {{ ref("snap_monitored_table_metadata") }} as snap
+            inner join
+                {{ ref("stg_monitored_tables") }} as mt
+                on snap.full_table_name = mt.full_table_name
+            where
+                snap.dbt_valid_to is null
+                and snap.snapshot_timestamp >= dateadd('day', -30, current_timestamp())
+                -- Exclude current hour to prevent duplicates with unioned CTE
+                and snap.snapshot_timestamp < date_trunc('hour', current_timestamp())
+                -- Only include enrolled tables (case-insensitive comparison)
+                and upper(snap.full_table_name) in (
+                    {%- for table in metadata_tables %}
+                        upper('{{ table.full_name }}'){% if not loop.last %},{% endif %}
+                    {%- endfor %}
+                )
             union all
         {% endif %}
         select *
@@ -561,3 +618,7 @@ from final
     -- for window calculations)
     where snapshot_timestamp > (select max(snapshot_timestamp) from {{ this }})
 {% endif %}
+
+-- Deduplicate in case of overlapping data (e.g., full-refresh loading historical +
+-- new)
+qualify row_number() over (partition by metric_id order by _loaded_at desc) = 1
