@@ -8,7 +8,7 @@ require-dbt-version: [">=1.3.0", "<2.0.0"]
 # SNOWFLAKE ONLY: This package uses Snowflake-specific features
 # (information_schema, generator(), date functions)
 
-profile: 'default'
+profile: 'dbt_anomaly_detection'
 
 # This setting configures which "profile" dbt uses for this project.
 # For package consumers, this will use their own profile configuration.
@@ -29,35 +29,36 @@ clean-targets:
 vars:
   # Volume anomaly detection settings
   volume_anomaly_detection:
-    # Default lookback period for anomaly detection (days)
-    lookback_days: 28
-    # Default minimum historical observations required
+    # Minimum historical observations required for anomaly detection
     min_historical_observations: 7
 
-    # Row Count CHANGE sensitivity (growth rate detection - more volatile)
-    # Calibrated from wide (quiet) to narrow (noisy) tolerance
-    row_count_change_sensitivity_very_low: 4.0    # 4σ threshold - wide, catches major growth issues (RECOMMENDED DEFAULT)
-    row_count_change_sensitivity_low: 3.0         # 3σ threshold - catches significant growth changes
-    row_count_change_sensitivity_medium: 2.0      # 2σ threshold - balanced middle ground
-    row_count_change_sensitivity_high: 1.5        # 1.5σ threshold - catches smaller deviations
-    row_count_change_sensitivity_very_high: 1.0   # 1σ threshold - narrow, very noisy
+    # # Row Count CHANGE sensitivity (growth rate detection - more volatile)
+    # # Calibrated from wide (quiet) to narrow (noisy) tolerance
+    # row_count_change_sensitivity_very_low: 20.0   # 20σ threshold (RECOMMENDED DEFAULT)
+    # row_count_change_sensitivity_low: 12.0        # 12σ threshold
+    # row_count_change_sensitivity_medium: 8.0      # 8σ threshold
+    # row_count_change_sensitivity_high: 6.0        # 6σ threshold
+    # row_count_change_sensitivity_very_high: 5.0   # 5σ threshold
 
-    # Absolute ROW COUNT sensitivity (total size detection - more stable)
-    # Calibrated from wide (quiet) to narrow (noisy) tolerance
-    row_count_sensitivity_very_low: 6.0     # 6σ threshold - very wide, only major issues (RECOMMENDED DEFAULT)
-    row_count_sensitivity_low: 4.0          # 4σ threshold - catches significant size changes
-    row_count_sensitivity_medium: 3.0       # 3σ threshold - balanced middle ground
-    row_count_sensitivity_high: 2.0         # 2σ threshold - catches smaller deviations
-    row_count_sensitivity_very_high: 1.0    # 1σ threshold - narrow, very noisy
+    # # Absolute ROW COUNT sensitivity (total size detection - more stable)
+    # # Calibrated from wide (quiet) to narrow (noisy) tolerance
+    # row_count_sensitivity_very_low: 16.0    # 16σ threshold (RECOMMENDED DEFAULT)
+    # row_count_sensitivity_low: 8.0          # 8σ threshold
+    # row_count_sensitivity_medium: 4.0       # 4σ threshold
+    # row_count_sensitivity_high: 2.0         # 2σ threshold
+    # row_count_sensitivity_very_high: 1.0    # 1σ threshold
 
-    # Enable/disable volume monitoring globally
-    enabled: true
+    # Materiality thresholds - prevents statistically significant but meaningless alerts
+    # Change-based: both must be exceeded to flag anomaly
+    materiality_change_rows: 1000    # Minimum absolute row deviation from expected change
+    materiality_change_pct: 2.0      # Minimum relative change (200%)
+    # Size-based: either must be exceeded to flag anomaly
+    materiality_count_rows: 100      # Minimum absolute row deviation from expected count
+    materiality_count_pct: 0.05      # Minimum relative change (5%)
 
   # Freshness anomaly detection settings
   freshness_anomaly_detection:
-    # Default lookback period for anomaly detection (days)
-    lookback_days: 28
-    # Default minimum historical observations required
+    # Minimum historical observations required for anomaly detection
     min_historical_observations: 7
     # Sensitivity thresholds (sigma/standard deviations from mean)
     # Calibrated from wide (quiet) to narrow (noisy) tolerance
@@ -66,8 +67,6 @@ vars:
     sensitivity_medium: 1.0      # 1σ threshold - balanced middle ground
     sensitivity_high: 0.75       # 0.75σ threshold - catches smaller staleness
     sensitivity_very_high: 0.5   # 0.5σ threshold - narrow, very noisy
-    # Enable/disable freshness monitoring globally
-    enabled: true
 
 snapshots:
   dbt_anomaly_detection:
@@ -77,12 +76,10 @@ snapshots:
 models:
   dbt_anomaly_detection:
     +materialized: incremental
-    +on_schema_change: "sync_all_columns"
+    +on_schema_change: "append_new_columns"
     +schema: "{{ 'dbt_anomaly_detection' if not target.name.startswith('dev_') else target.schema }}"
     # In dev: uses dev_<username> schema
     # In prod: uses dbt_anomaly_detection schema
-    # Disable dbt_constraints for this package (not compatible)
-    +dbt_constraints_enabled: false
     volume:
       +tags: ["anomaly_detection", "volume"]
     freshness:

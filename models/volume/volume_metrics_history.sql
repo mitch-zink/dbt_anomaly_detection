@@ -2,7 +2,7 @@
     config(
         materialized="incremental",
         unique_key="metric_id",
-        on_schema_change="sync_all_columns",
+        on_schema_change="append_new_columns",
         tags=["anomaly_detection", "volume"],
     )
 }}
@@ -25,119 +25,59 @@
 
     **Enrollment:**
     - Only processes tables enrolled via volume_anomaly test in schema.yml
-    - Enrollment determined by scanning graph.nodes (compiled at runtime via stg_monitored_tables)
+    - Enrollment determined by scanning graph.nodes (compiled at runtime via get_enrolled_tables macro)
 
     **Detection Logic:**
     Two-stage filtering (Statistical + Materiality):
 
     1. **Change-based detection** - Monitors growth rate (row_count_change):
        - Statistical: change > mean + (σ × stddev) OR change < mean - (σ × stddev)
-       - Materiality: >1,000 rows deviation AND >200% relative change
+       - Materiality: configurable absolute + relative thresholds (default >1,000 rows AND >200%)
        - Output: 'Row Count Change - Spike' or 'Row Count Change - Dip'
 
     2. **Size-based detection** - Monitors absolute row count:
        - Statistical: count > mean + (σ × stddev) OR count < mean - (σ × stddev)
-       - Materiality: >100 rows deviation AND >5% relative change
+       - Materiality: configurable absolute + relative thresholds (default >100 rows AND >5%)
        - Output: 'Row Count - Spike' or 'Row Count - Dip'
-
-    **Sensitivity Levels:**
-    Configurable sigma multipliers:
-    - Row Count Change: very_low=4.0σ, low=3.0σ, medium=2.0σ, high=1.5σ, very_high=1.0σ
-    - Absolute Row Count: very_low=6.0σ, low=4.0σ, medium=3.0σ, high=2.0σ, very_high=1.0σ
 
     **Output:**
     - 4 boolean flags: is_spike_high, is_drop_low, is_row_count_anomaly, is_anomaly
+    - is_anomaly is guaranteed consistent: simply (is_spike_high OR is_drop_low OR is_row_count_anomaly)
     - 3 reason columns: row_count_change_anomaly_reason, row_count_anomaly_reason, anomaly_reason
     - Rolling 28-day window statistics for dynamic baseline calculation
 */
+{#- Use shared macro to get enrolled tables -#}
+{%- set all_tables = get_enrolled_tables(["volume_anomaly"]) -%}
 {%- set custom_tables = [] -%}
 {%- set metadata_tables = [] -%}
-{%- if execute -%}
-    {%- for node in graph.nodes.values() -%}
-        {%- if node.resource_type == "test" -%}
-            {%- if node.test_metadata and node.test_metadata.name == "volume_anomaly" -%}
-                {%- set test_kwargs = node.test_metadata.kwargs -%}
-                {%- if node.depends_on.nodes -%}
-                    {%- for dep_node_id in node.depends_on.nodes -%}
-                        {%- if dep_node_id.startswith(
-                            "model."
-                        ) or dep_node_id.startswith("source.") -%}
-                            {# Check graph.sources for source tables, graph.nodes for models #}
-                            {%- if dep_node_id.startswith("source.") -%}
-                                {%- set ref_node = graph.sources.get(dep_node_id) -%}
-                            {%- else -%}
-                                {%- set ref_node = graph.nodes.get(dep_node_id) -%}
-                            {%- endif -%}
-                            {%- if ref_node -%}
-                                {%- set table_info = {
-                                    "database": ref_node.database,
-                                    "schema": ref_node.schema,
-                                    "name": (
-                                        ref_node.name
-                                        if ref_node.resource_type == "model"
-                                        else ref_node.identifier
-                                    ),
-                                    "full_name": ref_node.database
-                                    ~ "."
-                                    ~ ref_node.schema
-                                    ~ "."
-                                    ~ (
-                                        ref_node.name
-                                        if ref_node.resource_type == "model"
-                                        else ref_node.identifier
-                                    ),
-                                } -%}
-
-                                {%- if table_info.name not in [
-                                    "volume_metrics_history",
-                                    "freshness_metrics_history",
-                                ] -%}
-                                    {%- if test_kwargs.get("timestamp_column") -%}
-                                        {# Custom timestamp column - add to custom_tables #}
-                                        {%- do custom_tables.append(
-                                            {
-                                                "database": table_info.database,
-                                                "schema": table_info.schema,
-                                                "name": table_info.name,
-                                                "full_name": table_info.full_name,
-                                                "timestamp_column": test_kwargs.get(
-                                                    "timestamp_column"
-                                                ),
-                                                "timezone": test_kwargs.get(
-                                                    "timezone", "UTC"
-                                                ),
-                                                "training_period_days": test_kwargs.get(
-                                                    "training_period_days",
-                                                    30,
-                                                ),
-                                                "sensitivity": test_kwargs.get(
-                                                    "sensitivity", "very_low"
-                                                ),
-                                            }
-                                        ) -%}
-                                    {%- else -%}
-                                        {# No timestamp column - add to metadata_tables #}
-                                        {%- do metadata_tables.append(
-                                            {
-                                                "database": table_info.database,
-                                                "schema": table_info.schema,
-                                                "name": table_info.name,
-                                                "full_name": table_info.full_name,
-                                                "sensitivity": test_kwargs.get(
-                                                    "sensitivity", "very_low"
-                                                ),
-                                            }
-                                        ) -%}
-                                    {%- endif -%}
-                                {%- endif -%}
-                            {%- endif -%}
-                        {%- endif -%}
-                    {%- endfor -%}
-                {%- endif -%}
-            {%- endif -%}
-        {%- endif -%}
-    {%- endfor -%}
-{%- endif -%}
+{%- for t in all_tables -%}
+    {%- if t.kwargs.get("timestamp_column") -%}
+        {%- do custom_tables.append(
+            {
+                "database": t.database,
+                "schema": t.schema,
+                "name": t.name,
+                "full_name": t.full_name,
+                "timestamp_column": t.kwargs.get("timestamp_column"),
+                "timezone": t.kwargs.get("timezone", "UTC"),
+                "training_period_days": t.kwargs.get(
+                    "training_period_days", 30
+                ),
+                "sensitivity": t.kwargs.get("sensitivity", "very_low"),
+            }
+        ) -%}
+    {%- else -%}
+        {%- do metadata_tables.append(
+            {
+                "database": t.database,
+                "schema": t.schema,
+                "name": t.name,
+                "full_name": t.full_name,
+                "sensitivity": t.kwargs.get("sensitivity", "very_low"),
+            }
+        ) -%}
+    {%- endif -%}
+{%- endfor -%}
 
 -- Sensitivity to sigma multiplier mapping (read from vars in dbt_project.yml)
 -- Separate settings for row_count_change (growth rate) vs absolute row_count
@@ -175,6 +115,15 @@
     ),
 } -%}
 
+-- Materiality thresholds (configurable via vars)
+{%- set mat_change_rows = var(
+    "volume_anomaly_detection.materiality_change_rows", 1000
+) -%}
+{%- set mat_change_pct = var("volume_anomaly_detection.materiality_change_pct", 2.0) -%}
+{%- set mat_count_rows = var("volume_anomaly_detection.materiality_count_rows", 100) -%}
+{%- set mat_count_pct = var("volume_anomaly_detection.materiality_count_pct", 0.05) -%}
+{%- set min_obs = var("volume_anomaly_detection.min_historical_observations", 7) -%}
+
 -- Query tables with custom timestamp columns (hourly granularity for backfill)
 with
     {%- if custom_tables | length > 0 %}
@@ -185,12 +134,35 @@ with
                     'hour',
                     seq4(),
                     dateadd('day', -30, date_trunc('hour', current_timestamp()))
-                ) as snapshot_timestamp
+                )::timestamp_ntz as snapshot_timestamp
             from table(generator(rowcount => 30 * 24))  -- 30 days * 24 hours
         ),
 
         {%- for table in custom_tables %}
-            -- Get cumulative row count as of each hour (running total)
+            -- Base count: rows before the backfill window (single scan)
+            base_count_{{ loop.index }} as (
+                select count(*) as cnt
+                from {{ table.database }}.{{ table.schema }}.{{ table.name }} t
+                where
+                    t.{{ table.timestamp_column }} is not null
+                    and t.{{ table.timestamp_column }}
+                    < dateadd('day', -30, date_trunc('hour', current_timestamp()))
+            ),
+
+            -- Hourly incremental counts within the backfill window
+            hourly_counts_{{ loop.index }} as (
+                select
+                    date_trunc('hour', {{ table.timestamp_column }}) as data_hour,
+                    count(*) as hourly_count
+                from {{ table.database }}.{{ table.schema }}.{{ table.name }}
+                where
+                    {{ table.timestamp_column }} is not null
+                    and {{ table.timestamp_column }}
+                    >= dateadd('day', -30, date_trunc('hour', current_timestamp()))
+                group by 1
+            ),
+
+            -- Cumulative row count via running SUM (replaces correlated subquery)
             custom_table_metrics_{{ loop.index }} as (
                 select
                     '{{ table.database }}' as database_name,
@@ -198,14 +170,13 @@ with
                     '{{ table.name }}' as table_name,
                     '{{ table.full_name }}' as full_table_name,
 
-                    -- Cumulative row count: all rows with timestamp <= this hour
-                    (
-                        select count(*)
-                        from {{ table.database }}.{{ table.schema }}.{{ table.name }} t
-                        where
-                            t.{{ table.timestamp_column }} is not null
-                            and t.{{ table.timestamp_column }}
-                            <= spine.snapshot_timestamp
+                    -- Cumulative row count: base count + running sum of hourly counts
+                    (select cnt from base_count_{{ loop.index }}) + coalesce(
+                        sum(hc.hourly_count) over (
+                            order by spine.snapshot_timestamp
+                            rows between unbounded preceding and current row
+                        ),
+                        0
                     ) as row_count,
 
                     spine.snapshot_timestamp,
@@ -221,6 +192,9 @@ with
                     current_timestamp() as _loaded_at
 
                 from hourly_spine spine
+                left join
+                    hourly_counts_{{ loop.index }} hc
+                    on spine.snapshot_timestamp = hc.data_hour
                 where spine.snapshot_timestamp <= current_timestamp()
             ),
         {%- endfor %}
@@ -298,6 +272,7 @@ with
                 true
                 and t.table_type = 'BASE TABLE'
                 and t.row_count is not null
+                and t.snapshot_timestamp is not null
                 -- Read ALL snapshot records (including historical versions for
                 -- backfill)
                 -- Only include enrolled tables (case-insensitive comparison)
@@ -350,13 +325,12 @@ with
         from metadata_metrics
     ),
 
-    -- Include historical data for metadata mode to enable proper window function
-    -- calculations
-    with_history as (
+    -- Include historical data for proper window function calculations
+    -- with_history_raw unions old + new, then dedup removes overlap
+    with_history_raw as (
         {% if is_incremental() %}
             -- On incremental runs, union new snapshots with historical data (last 30
             -- days)
-            -- Only select base columns to match structure of unioned CTE
             select
                 database_name,
                 schema_name,
@@ -376,6 +350,18 @@ with
         {% endif %}
         select *
         from unioned
+    ),
+
+    -- Deduplicate in case historical and new data overlap on the same timestamp
+    with_history as (
+        select *
+        from with_history_raw
+        qualify
+            row_number() over (
+                partition by full_table_name, source_type, snapshot_timestamp
+                order by _loaded_at desc nulls last
+            )
+            = 1
     ),
 
     -- Calculate row count change from previous snapshot
@@ -408,7 +394,6 @@ with
             -- Calculate rolling statistics on the change column (28-day time window)
             -- Uses INTERVAL '1 second' PRECEDING to exclude current row from baseline
             -- calculation
-            -- (equivalent to ROWS BETWEEN ... AND 1 PRECEDING in row-based windows)
             avg(row_count_change) over (
                 partition by full_table_name, source_type
                 order by
@@ -458,8 +443,8 @@ with
         from with_change
     ),
 
-    -- Add metric_id and anomaly flags
-    final as (
+    -- Compute individual detection flags with materiality filters
+    with_flags as (
         select
             -- Identifiers
             database_name,
@@ -474,8 +459,7 @@ with
             row_count,
             row_count_change,
 
-            -- Statistical baselines for row_count_CHANGE (uses
-            -- row_count_change_sigma_multiplier)
+            -- Statistical baselines for row_count_CHANGE
             round(expected_change_mean, 0) as expected_change_mean,
             round(expected_change_stddev, 0) as expected_change_stddev,
             round(
@@ -489,8 +473,7 @@ with
                 0
             ) as expected_change_max,
 
-            -- Statistical baselines for ABSOLUTE row_count (uses
-            -- row_count_sigma_multiplier)
+            -- Statistical baselines for ABSOLUTE row_count
             round(expected_row_count_mean, 0) as expected_row_count_mean,
             round(expected_row_count_stddev, 0) as expected_row_count_stddev,
             round(
@@ -507,8 +490,7 @@ with
             observation_count,
 
             -- Detection flags with materiality filters
-            -- For change-based: Require BOTH absolute (>1000) AND relative (>200%)
-            -- thresholds
+            -- Change-based: statistical threshold AND absolute + relative materiality
             (
                 {{
                     is_spike_high(
@@ -517,22 +499,21 @@ with
                         expected_change_stddev="expected_change_stddev",
                         sigma_multiplier="row_count_change_sigma_multiplier",
                         observation_count="observation_count",
-                        min_observations=var(
-                            "volume_anomaly_detection.min_historical_observations", 7
-                        ),
+                        min_observations=min_obs,
                     )
                 }}
-                and abs(row_count_change - expected_change_mean) >= 1000
+                and abs(row_count_change - expected_change_mean)
+                >= {{ mat_change_rows }}
                 and (
                     case
                         when expected_change_mean = 0
-                        then abs(row_count_change) >= 1000
+                        then abs(row_count_change) >= {{ mat_change_rows }}
                         else
                             abs(
                                 (row_count_change - expected_change_mean)
                                 / nullif(abs(expected_change_mean), 0)
                             )
-                            >= 2.0
+                            >= {{ mat_change_pct }}
                     end
                 )
             ) as is_spike_high,
@@ -545,32 +526,28 @@ with
                         expected_change_stddev="expected_change_stddev",
                         sigma_multiplier="row_count_change_sigma_multiplier",
                         observation_count="observation_count",
-                        min_observations=var(
-                            "volume_anomaly_detection.min_historical_observations", 7
-                        ),
+                        min_observations=min_obs,
                     )
                 }}
-                and abs(row_count_change - expected_change_mean) >= 1000
+                and abs(row_count_change - expected_change_mean)
+                >= {{ mat_change_rows }}
                 and (
                     case
                         when expected_change_mean = 0
-                        then abs(row_count_change) >= 1000
+                        then abs(row_count_change) >= {{ mat_change_rows }}
                         else
                             abs(
                                 (row_count_change - expected_change_mean)
                                 / nullif(abs(expected_change_mean), 0)
                             )
-                            >= 2.0
+                            >= {{ mat_change_pct }}
                     end
                 )
             ) as is_drop_low,
 
             -- Absolute row count out of range detection with materiality filter
             case
-                when
-                    observation_count
-                    <
-                    {{ var("volume_anomaly_detection.min_historical_observations", 7) }}
+                when observation_count < {{ min_obs }}
                 then false
                 when expected_row_count_stddev = 0 or expected_row_count_stddev is null
                 then false
@@ -586,34 +563,31 @@ with
                         )
                     )
                     and (
-                        abs(row_count - expected_row_count_mean) >= 100
+                        abs(row_count - expected_row_count_mean) >= {{ mat_count_rows }}
                         or case
                             when expected_row_count_mean = 0
-                            then abs(row_count) >= 100
+                            then abs(row_count) >= {{ mat_count_rows }}
                             else
                                 abs(
                                     (row_count - expected_row_count_mean)
                                     / nullif(expected_row_count_mean, 0)
                                 )
-                                >= 0.05
+                                >= {{ mat_count_pct }}
                         end
                     )
                 then true
                 else false
             end as is_row_count_anomaly,
 
-            -- Materiality checks for filtering out statistically significant but
-            -- meaningless changes
-            -- Check 1: Absolute magnitude (raw change is large enough to matter)
+            -- Materiality checks (diagnostic columns)
             abs(row_count_change - expected_change_mean)
-            >= 100 as is_material_absolute_change,
+            >= {{ mat_count_rows }} as is_material_absolute_change,
             abs(row_count - expected_row_count_mean)
-            >= 100 as is_material_absolute_count,
+            >= {{ mat_count_rows }} as is_material_absolute_count,
 
-            -- Check 2: Relative magnitude (% deviation from expected is large enough)
             case
                 when expected_change_mean = 0
-                then abs(row_count_change) >= 100
+                then abs(row_count_change) >= {{ mat_count_rows }}
                 else
                     abs(
                         (row_count_change - expected_change_mean)
@@ -623,13 +597,13 @@ with
             end as is_material_relative_change,
             case
                 when expected_row_count_mean = 0
-                then abs(row_count) >= 100
+                then abs(row_count) >= {{ mat_count_rows }}
                 else
                     abs(
                         (row_count - expected_row_count_mean)
                         / nullif(expected_row_count_mean, 0)
                     )
-                    >= 0.05
+                    >= {{ mat_count_pct }}
             end as is_material_relative_count,
 
             -- Statistical anomaly flags (without materiality filter)
@@ -640,9 +614,7 @@ with
                     expected_change_stddev="expected_change_stddev",
                     sigma_multiplier="row_count_change_sigma_multiplier",
                     observation_count="observation_count",
-                    min_observations=var(
-                        "volume_anomaly_detection.min_historical_observations", 7
-                    ),
+                    min_observations=min_obs,
                 )
             }} as is_spike_high_statistical,
 
@@ -653,15 +625,12 @@ with
                     expected_change_stddev="expected_change_stddev",
                     sigma_multiplier="row_count_change_sigma_multiplier",
                     observation_count="observation_count",
-                    min_observations=var(
-                        "volume_anomaly_detection.min_historical_observations", 7
-                    ),
+                    min_observations=min_obs,
                 )
             }} as is_drop_low_statistical,
 
             (
-                observation_count
-                >= {{ var("volume_anomaly_detection.min_historical_observations", 7) }}
+                observation_count >= {{ min_obs }}
                 and expected_row_count_stddev > 0
                 and expected_row_count_stddev is not null
                 and (
@@ -675,170 +644,6 @@ with
                     )
                 )
             ) as is_row_count_anomaly_statistical,
-
-            -- Overall anomaly flag: Statistical anomaly AND passes materiality filter
-            -- Disabled is_growth_stalled to reduce false positives
-            (
-                {#
-                {{
-                    is_growth_stalled(
-                        metric_change="row_count_change",
-                        expected_change_mean="expected_change_mean",
-                        observation_count="observation_count",
-                        min_observations=var(
-                            "volume_anomaly_detection.min_historical_observations", 7
-                        ),
-                        positive_change_threshold=100,
-                    )
-                }}
-                or
-                #}
-                {{
-                    is_spike_high(
-                        metric_change="row_count_change",
-                        expected_change_mean="expected_change_mean",
-                        expected_change_stddev="expected_change_stddev",
-                        sigma_multiplier="row_count_change_sigma_multiplier",
-                        observation_count="observation_count",
-                        min_observations=var(
-                            "volume_anomaly_detection.min_historical_observations", 7
-                        ),
-                    )
-                }}
-                or {{
-                    is_drop_low(
-                        metric_change="row_count_change",
-                        expected_change_mean="expected_change_mean",
-                        expected_change_stddev="expected_change_stddev",
-                        sigma_multiplier="row_count_change_sigma_multiplier",
-                        observation_count="observation_count",
-                        min_observations=var(
-                            "volume_anomaly_detection.min_historical_observations", 7
-                        ),
-                    )
-                }}
-                or (
-                    observation_count
-                    >= {{
-                        var(
-                            "volume_anomaly_detection.min_historical_observations",
-                            7,
-                        )
-                    }}
-                    and expected_row_count_stddev > 0
-                    and expected_row_count_stddev is not null
-                    and (
-                        row_count < (
-                            expected_row_count_mean
-                            - (row_count_sigma_multiplier * expected_row_count_stddev)
-                        )
-                        or row_count > (
-                            expected_row_count_mean
-                            + (row_count_sigma_multiplier * expected_row_count_stddev)
-                        )
-                    )
-                    and (
-                        abs(row_count - expected_row_count_mean) >= 100
-                        or case
-                            when expected_row_count_mean = 0
-                            then abs(row_count) >= 100
-                            else
-                                abs(
-                                    (row_count - expected_row_count_mean)
-                                    / nullif(expected_row_count_mean, 0)
-                                )
-                                >= 0.05
-                        end
-                    )
-                )
-            ) as is_anomaly,
-
-            -- Separate anomaly reasons for change-based detection
-            case
-                when
-                    {{
-                        is_spike_high(
-                            metric_change="row_count_change",
-                            expected_change_mean="expected_change_mean",
-                            expected_change_stddev="expected_change_stddev",
-                            sigma_multiplier="row_count_change_sigma_multiplier",
-                            observation_count="observation_count",
-                            min_observations=var(
-                                "volume_anomaly_detection.min_historical_observations",
-                                7,
-                            ),
-                        )
-                    }}
-                then 'Row Count Change - Spike'
-                when
-                    {{
-                        is_drop_low(
-                            metric_change="row_count_change",
-                            expected_change_mean="expected_change_mean",
-                            expected_change_stddev="expected_change_stddev",
-                            sigma_multiplier="row_count_change_sigma_multiplier",
-                            observation_count="observation_count",
-                            min_observations=var(
-                                "volume_anomaly_detection.min_historical_observations",
-                                7,
-                            ),
-                        )
-                    }}
-                then 'Row Count Change - Dip'
-                else null
-            end as row_count_change_anomaly_reason,
-
-            -- Separate anomaly reasons for size-based detection
-            case
-                when
-                    (
-                        observation_count
-                        >= {{
-                            var(
-                                "volume_anomaly_detection.min_historical_observations",
-                                7,
-                            )
-                        }}
-                        and expected_row_count_stddev > 0
-                        and expected_row_count_stddev is not null
-                        and row_count < (
-                            expected_row_count_mean
-                            - (row_count_sigma_multiplier * expected_row_count_stddev)
-                        )
-                    )
-                then 'Row Count - Dip'
-                when
-                    (
-                        observation_count
-                        >= {{
-                            var(
-                                "volume_anomaly_detection.min_historical_observations",
-                                7,
-                            )
-                        }}
-                        and expected_row_count_stddev > 0
-                        and expected_row_count_stddev is not null
-                        and row_count > (
-                            expected_row_count_mean
-                            + (row_count_sigma_multiplier * expected_row_count_stddev)
-                        )
-                    )
-                then 'Row Count - Spike'
-                else null
-            end as row_count_anomaly_reason,
-
-            -- Combined anomaly reason showing all detected issues
-            case
-                when
-                    row_count_change_anomaly_reason is not null
-                    and row_count_anomaly_reason is not null
-                then row_count_change_anomaly_reason || ', ' || row_count_anomaly_reason
-                when row_count_change_anomaly_reason is not null
-                then row_count_change_anomaly_reason
-                when row_count_anomaly_reason is not null
-                then row_count_anomaly_reason
-                else null
-            end as anomaly_reason,
 
             -- Configuration
             sensitivity,
@@ -860,6 +665,96 @@ with
             _loaded_at
 
         from change_stats
+    ),
+
+    -- Derive is_anomaly and reason columns from individual flags
+    -- This guarantees is_anomaly is always consistent with individual flags
+    final as (
+        select
+            database_name,
+            schema_name,
+            table_name,
+            full_table_name,
+            source_type,
+            timestamp_column,
+            snapshot_timestamp,
+            row_count,
+            row_count_change,
+            expected_change_mean,
+            expected_change_stddev,
+            expected_change_min,
+            expected_change_max,
+            expected_row_count_mean,
+            expected_row_count_stddev,
+            expected_row_count_min,
+            expected_row_count_max,
+            observation_count,
+            is_spike_high,
+            is_drop_low,
+            is_row_count_anomaly,
+            is_material_absolute_change,
+            is_material_absolute_count,
+            is_material_relative_change,
+            is_material_relative_count,
+            is_spike_high_statistical,
+            is_drop_low_statistical,
+            is_row_count_anomaly_statistical,
+
+            -- Master anomaly flag: guaranteed consistent with individual flags
+            (is_spike_high or is_drop_low or is_row_count_anomaly) as is_anomaly,
+
+            -- Anomaly reasons derived from flags
+            case
+                when is_spike_high
+                then 'Row Count Change - Spike'
+                when is_drop_low
+                then 'Row Count Change - Dip'
+                else null
+            end as row_count_change_anomaly_reason,
+
+            case
+                when is_row_count_anomaly and row_count < expected_row_count_mean
+                then 'Row Count - Dip'
+                when is_row_count_anomaly
+                then 'Row Count - Spike'
+                else null
+            end as row_count_anomaly_reason,
+
+            -- Combined anomaly reason (comma-separated if multiple types detected)
+            -- Note: Snowflake's concat_ws returns NULL if ANY arg is NULL,
+            -- so we use array_construct_compact (which skips NULLs) instead
+            nullif(
+                array_to_string(
+                    array_construct_compact(
+                        case
+                            when is_spike_high
+                            then 'Row Count Change - Spike'
+                            when is_drop_low
+                            then 'Row Count Change - Dip'
+                            else null
+                        end,
+                        case
+                            when
+                                is_row_count_anomaly
+                                and row_count < expected_row_count_mean
+                            then 'Row Count - Dip'
+                            when is_row_count_anomaly
+                            then 'Row Count - Spike'
+                            else null
+                        end
+                    ),
+                    ', '
+                ),
+                ''
+            ) as anomaly_reason,
+
+            sensitivity,
+            row_count_change_sigma_multiplier,
+            row_count_sigma_multiplier,
+            metric_id,
+            _loaded_at
+
+        from with_flags
     )
 
 select *

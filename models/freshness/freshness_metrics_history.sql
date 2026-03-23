@@ -2,7 +2,7 @@
     config(
         materialized="incremental",
         unique_key="metric_id",
-        on_schema_change="sync_all_columns",
+        on_schema_change="append_new_columns",
         tags=["anomaly_detection", "freshness"],
     )
 }}
@@ -37,110 +37,49 @@
     - Boolean is_stale flag when data is staler than expected
     - Sensitivity levels control sigma multipliers (very_low=3σ recommended)
 */
+{#- Use shared macro to get enrolled tables -#}
+{%- set all_tables = get_enrolled_tables(["freshness_anomaly"]) -%}
 {%- set custom_tables = [] -%}
 {%- set metadata_tables = [] -%}
-{%- if execute -%}
-    {%- for node in graph.nodes.values() -%}
-        {%- if node.resource_type == "test" -%}
-            {%- if node.test_metadata and node.test_metadata.name == "freshness_anomaly" -%}
-                {%- set test_kwargs = node.test_metadata.kwargs -%}
-                {%- if node.depends_on.nodes -%}
-                    {%- for dep_node_id in node.depends_on.nodes -%}
-                        {%- if dep_node_id.startswith(
-                            "model."
-                        ) or dep_node_id.startswith("source.") -%}
-                            {# Check graph.sources for source tables, graph.nodes for models #}
-                            {%- if dep_node_id.startswith("source.") -%}
-                                {%- set ref_node = graph.sources.get(dep_node_id) -%}
-                            {%- else -%}
-                                {%- set ref_node = graph.nodes.get(dep_node_id) -%}
-                            {%- endif -%}
-                            {%- if ref_node -%}
-                                {%- set table_info = {
-                                    "database": ref_node.database,
-                                    "schema": ref_node.schema,
-                                    "name": (
-                                        ref_node.name
-                                        if ref_node.resource_type == "model"
-                                        else ref_node.identifier
-                                    ),
-                                    "full_name": ref_node.database
-                                    ~ "."
-                                    ~ ref_node.schema
-                                    ~ "."
-                                    ~ (
-                                        ref_node.name
-                                        if ref_node.resource_type == "model"
-                                        else ref_node.identifier
-                                    ),
-                                } -%}
-
-                                {%- if table_info.name not in [
-                                    "volume_metrics_history",
-                                    "freshness_metrics_history",
-                                ] -%}
-                                    {%- if test_kwargs.get("timestamp_column") -%}
-                                        {# Custom timestamp column - add to custom_tables #}
-                                        {%- do custom_tables.append(
-                                            {
-                                                "database": table_info.database,
-                                                "schema": table_info.schema,
-                                                "name": table_info.name,
-                                                "full_name": table_info.full_name,
-                                                "timestamp_column": test_kwargs.get(
-                                                    "timestamp_column"
-                                                ),
-                                                "timezone": test_kwargs.get(
-                                                    "timezone", "UTC"
-                                                ),
-                                                "training_period_days": test_kwargs.get(
-                                                    "training_period_days",
-                                                    90,
-                                                ),
-                                                "sensitivity": test_kwargs.get(
-                                                    "sensitivity", "very_low"
-                                                ),
-                                            }
-                                        ) -%}
-                                    {%- else -%}
-                                        {# No timestamp column - add to metadata_tables #}
-                                        {%- do metadata_tables.append(
-                                            {
-                                                "database": table_info.database,
-                                                "schema": table_info.schema,
-                                                "name": table_info.name,
-                                                "full_name": table_info.full_name,
-                                                "sensitivity": test_kwargs.get(
-                                                    "sensitivity", "very_low"
-                                                ),
-                                            }
-                                        ) -%}
-                                    {%- endif -%}
-                                {%- endif -%}
-                            {%- endif -%}
-                        {%- endif -%}
-                    {%- endfor -%}
-                {%- endif -%}
-            {%- endif -%}
-        {%- endif -%}
-    {%- endfor -%}
-{%- endif -%}
+{%- for t in all_tables -%}
+    {%- if t.kwargs.get("timestamp_column") -%}
+        {%- do custom_tables.append(
+            {
+                "database": t.database,
+                "schema": t.schema,
+                "name": t.name,
+                "full_name": t.full_name,
+                "timestamp_column": t.kwargs.get("timestamp_column"),
+                "timezone": t.kwargs.get("timezone", "UTC"),
+                "training_period_days": t.kwargs.get(
+                    "training_period_days", 90
+                ),
+                "sensitivity": t.kwargs.get("sensitivity", "very_low"),
+            }
+        ) -%}
+    {%- else -%}
+        {%- do metadata_tables.append(
+            {
+                "database": t.database,
+                "schema": t.schema,
+                "name": t.name,
+                "full_name": t.full_name,
+                "sensitivity": t.kwargs.get("sensitivity", "very_low"),
+            }
+        ) -%}
+    {%- endif -%}
+{%- endfor -%}
 
 -- Sensitivity to sigma multiplier mapping (read from vars in dbt_project.yml)
--- Freshness uses different thresholds than volume because staleness patterns are more
--- stable
--- Universal defaults balanced for production use - catch abandoned tables without
--- excessive noise
--- Override in your project's dbt_project.yml under freshness_anomaly_detection vars
 {%- set sensitivity_map = {
     "very_low": var(
-        "freshness_anomaly_detection.sensitivity_very_low", 10.0
+        "freshness_anomaly_detection.sensitivity_very_low", 2.0
     ),
-    "low": var("freshness_anomaly_detection.sensitivity_low", 6.0),
-    "medium": var("freshness_anomaly_detection.sensitivity_medium", 4.0),
-    "high": var("freshness_anomaly_detection.sensitivity_high", 2.5),
+    "low": var("freshness_anomaly_detection.sensitivity_low", 1.5),
+    "medium": var("freshness_anomaly_detection.sensitivity_medium", 1.0),
+    "high": var("freshness_anomaly_detection.sensitivity_high", 0.75),
     "very_high": var(
-        "freshness_anomaly_detection.sensitivity_very_high", 1.5
+        "freshness_anomaly_detection.sensitivity_very_high", 0.5
     ),
 } -%}
 
@@ -153,7 +92,7 @@ with
                     'hour',
                     seq4(),
                     dateadd('day', -30, date_trunc('hour', current_timestamp()))
-                ) as snapshot_timestamp
+                )::timestamp_ntz as snapshot_timestamp
             from table(generator(rowcount => 30 * 24))  -- 30 days * 24 hours (matches rolling window period)
         ),
 
@@ -385,13 +324,12 @@ with
         from metadata_metrics
     ),
 
-    -- Include historical data for metadata mode to enable proper window function
-    -- calculations
-    -- IMPORTANT: Always include historical snapshot data (even on full-refresh)
-    -- to ensure rolling window statistics have sufficient observations
-    with_history as (
+    -- Include historical data for proper window function calculations
+    -- with_history_raw unions old + new, then dedup removes overlap
+    with_history_raw as (
         {% if is_incremental() %}
-            -- Incremental: Load from existing table
+            -- On incremental runs, union new snapshots with historical data (last 30
+            -- days)
             select
                 database_name,
                 schema_name,
@@ -410,61 +348,21 @@ with
             from {{ this }}
             where snapshot_timestamp >= dateadd('day', -30, current_timestamp())
             union all
-        {% else %}
-            -- Full-refresh: Load from snapshot to preserve historical context
-            -- Without this, rolling windows would only see current run's data
-            select
-                snap.table_catalog as database_name,
-                snap.table_schema as schema_name,
-                snap.table_name,
-                snap.full_table_name,
-                snap.created as table_created_at,
-                snap.last_altered as table_last_altered_at,
-                snap.snapshot_timestamp,
-                'metadata' as source_type,
-                cast(null as varchar) as timestamp_column,
-                greatest(
-                    0, datediff('hour', snap.last_altered, snap.snapshot_timestamp)
-                ) as hours_since_last_update,
-                greatest(
-                    0, datediff('minute', snap.last_altered, snap.snapshot_timestamp)
-                ) as minutes_since_last_update,
-                -- Map sensitivity from test configuration
-                case
-                    upper(snap.full_table_name)
-                    {%- for table in metadata_tables %}
-                        when upper('{{ table.full_name }}')
-                        then '{{ table.sensitivity }}'
-                    {%- endfor %}
-                end as sensitivity,
-                -- Map sigma multiplier from sensitivity_map
-                case
-                    upper(snap.full_table_name)
-                    {%- for table in metadata_tables %}
-                        when upper('{{ table.full_name }}')
-                        then {{ sensitivity_map[table.sensitivity] }}
-                    {%- endfor %}
-                end as sigma_multiplier,
-                snap.snapshot_timestamp as _loaded_at
-            from {{ ref("snap_monitored_table_metadata") }} as snap
-            inner join
-                {{ ref("stg_monitored_tables") }} as mt
-                on snap.full_table_name = mt.full_table_name
-            where
-                snap.dbt_valid_to is null
-                and snap.snapshot_timestamp >= dateadd('day', -30, current_timestamp())
-                -- Exclude current hour to prevent duplicates with unioned CTE
-                and snap.snapshot_timestamp < date_trunc('hour', current_timestamp())
-                -- Only include enrolled tables (case-insensitive comparison)
-                and upper(snap.full_table_name) in (
-                    {%- for table in metadata_tables %}
-                        upper('{{ table.full_name }}'){% if not loop.last %},{% endif %}
-                    {%- endfor %}
-                )
-            union all
         {% endif %}
         select *
         from unioned
+    ),
+
+    -- Deduplicate in case historical and new data overlap on the same timestamp
+    with_history as (
+        select *
+        from with_history_raw
+        qualify
+            row_number() over (
+                partition by full_table_name, source_type, snapshot_timestamp
+                order by _loaded_at desc nulls last
+            )
+            = 1
     ),
 
     -- Calculate anomaly detection metrics using rolling window
@@ -618,7 +516,3 @@ from final
     -- for window calculations)
     where snapshot_timestamp > (select max(snapshot_timestamp) from {{ this }})
 {% endif %}
-
--- Deduplicate in case of overlapping data (e.g., full-refresh loading historical +
--- new)
-qualify row_number() over (partition by metric_id order by _loaded_at desc) = 1

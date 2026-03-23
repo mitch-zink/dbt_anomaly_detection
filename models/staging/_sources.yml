@@ -4,7 +4,7 @@ sources:
   - name: snapshots
     description: Snapshot tables containing historical metadata
     database: "{{ target.database }}"
-    schema: dbt_anomaly_detection
+    schema: "{{ 'dbt_anomaly_detection' if not target.name.startswith('dev_') else target.schema }}"
     tables:
       - name: snap_monitored_table_metadata
         description: |

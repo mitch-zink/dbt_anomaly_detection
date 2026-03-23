@@ -79,10 +79,13 @@ models:
         tests:
           - not_null
           - dbt_utils.expression_is_true:
-              expression: ">= 0"
+              arguments:
+                expression: ">= 0"
 
       - name: snapshot_timestamp
-        description: Exact timestamp when snapshot was taken (may be NULL for backfilled metadata records)
+        description: Exact timestamp when snapshot was taken
+        tests:
+          - not_null
 
       - name: source_type
         description: |
@@ -92,7 +95,8 @@ models:
         tests:
           - not_null
           - accepted_values:
-              values: ['table', 'metadata']
+              arguments:
+                values: ['table', 'metadata']
 
       - name: timestamp_column
         description: |
@@ -124,16 +128,16 @@ models:
       - name: expected_row_count_min
         description: |
           Minimum expected row count threshold calculated as:
-          expected_row_count_mean - (σ × expected_row_count_stddev)
+          expected_row_count_mean - (row_count_sigma_multiplier × expected_row_count_stddev)
 
-          Where σ (sigma_multiplier) varies by sensitivity level (very_low=25σ, low=15σ, medium=8σ, high=4σ, very_high=2.5σ).
+          Uses absolute row count sigma: very_low=16σ, low=8σ, medium=4σ, high=2σ, very_high=1σ.
 
       - name: expected_row_count_max
         description: |
           Maximum expected row count threshold calculated as:
-          expected_row_count_mean + (σ × expected_row_count_stddev)
+          expected_row_count_mean + (row_count_sigma_multiplier × expected_row_count_stddev)
 
-          Where σ (sigma_multiplier) varies by sensitivity level (very_low=25σ, low=15σ, medium=8σ, high=4σ, very_high=2.5σ).
+          Uses absolute row count sigma: very_low=16σ, low=8σ, medium=4σ, high=2σ, very_high=1σ.
 
       - name: is_spike_high
         description: |

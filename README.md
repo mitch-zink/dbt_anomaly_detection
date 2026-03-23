@@ -4,7 +4,7 @@ A dbt package for intelligent data quality monitoring using statistical anomaly 
 
 > **🔷 Snowflake Only**: This package uses Snowflake-specific features (`information_schema`, `generator()`, date functions)
 
-> **Design Philosophy**: Built to prevent alert fatigue. Default sensitivity (`very_low`) uses wide statistical bounds combined with materiality filters. Volume detection uses 20σ/16σ for change/count-based detection, freshness uses 10σ. Detects anomalies in **growth patterns**, not just absolute values.
+> **Design Philosophy**: Built to prevent alert fatigue. Default sensitivity (`very_low`) uses wide statistical bounds (20σ for growth rate, 16σ for absolute count) combined with configurable materiality filters. Detects anomalies in **growth patterns**, not just absolute values.
 
 ## Features
 
@@ -15,9 +15,9 @@ A dbt package for intelligent data quality monitoring using statistical anomaly 
 - **Absolute row count detection** - Monitors total table size:
   - **Row Count - Dip** - Absolute row count below expected range (count < mean - σ × stddev) AND passes materiality filter
   - **Row Count - Spike** - Absolute row count above expected range (count > mean + σ × stddev) AND passes materiality filter
-- **Enterprise-grade materiality filters** - Prevents statistically significant but meaningless alerts:
-  - **Change-based**: Requires >1,000 rows deviation AND >200% relative change
-  - **Count-based**: Requires >100 rows deviation AND >5% relative change
+- **Configurable materiality filters** - Prevents statistically significant but meaningless alerts:
+  - **Change-based**: Requires >1,000 rows deviation AND >200% relative change (configurable via vars)
+  - **Count-based**: Requires >100 rows deviation AND >5% relative change (configurable via vars)
 - **Fully dynamic & frequency-agnostic** - Works for daily, hourly, weekly, or any load frequency
 - **Configurable sensitivity levels** (very_low/low/medium/high/very_high) using sigma multipliers
 - **Dual-mode operation**: Metadata snapshots OR custom timestamp column (instant 30-day backfill)
@@ -284,33 +284,25 @@ sigma_multiplier          | decimal   | Sigma multiplier used for threshold calc
 
 Control how strict the anomaly detection is using sigma multipliers.
 
-**Note:** Volume and Freshness use different sigma ranges because they measure different phenomena:
-- **Volume** (row counts) has high variance → wider sigmas needed
-- **Freshness** (staleness hours) has low variance → tighter sigmas appropriate
+**Volume Detection** uses separate sigma multipliers for growth rate and absolute count:
 
-#### Volume Sensitivity (Row Count Detection)
+| Sensitivity  | Growth Rate (σ) | Absolute Count (σ) | Use Case |
+|--------------|-----------------|-------------------|----------|
+| `very_low`   | 20.0            | 16.0              | **Ultra-wide tolerance** - only catastrophic issues (**RECOMMENDED**) |
+| `low`        | 12.0            | 8.0               | Very wide tolerance - major anomalies only |
+| `medium`     | 8.0             | 4.0               | Balanced sensitivity |
+| `high`       | 6.0             | 2.0               | Tighter tolerance - more sensitive |
+| `very_high`  | 5.0             | 1.0               | Narrow tolerance - most sensitive (will be noisy) |
 
-**Note:** Volume detection uses two separate sigma settings (see dbt_project.yml):
-- `row_count_change_sensitivity_*` - For growth rate anomalies
-- `row_count_sensitivity_*` - For absolute row count anomalies
+**Freshness Detection** uses a single sigma multiplier:
 
-| Sensitivity  | Change σ | Count σ | Use Case |
-|--------------|----------|---------|----------|
-| `very_low`   | 20.0     | 16.0    | **Wide tolerance** - catches major anomalies (**RECOMMENDED for production**) |
-| `low`        | 12.0     | 8.0     | Moderate tolerance - significant anomalies |
-| `medium`     | 8.0      | 4.0     | Balanced sensitivity |
-| `high`       | 6.0      | 2.0     | Tighter tolerance - more sensitive |
-| `very_high`  | 5.0      | 1.0     | Narrow tolerance - most sensitive (will be noisy) |
-
-#### Freshness Sensitivity (Staleness Detection)
-
-| Sensitivity  | Sigma (σ) | Typical Threshold | Use Case |
-|--------------|-----------|------------------|----------|
-| `very_low`   | 10.0      | 3-7 days         | **Forgiving** - catches abandoned tables (**RECOMMENDED for production**) |
-| `low`        | 6.0       | 2-4 days         | Moderate tolerance - tables stale days |
-| `medium`     | 4.0       | 1-3 days         | Balanced sensitivity |
-| `high`       | 2.5       | Hours to 1 day   | Strict - catches tables stale beyond normal pattern |
-| `very_high`  | 1.5       | Hours            | Very strict - will generate noise from normal variance |
+| Sensitivity  | Sigma (σ) | Use Case |
+|--------------|-----------|----------|
+| `very_low`   | 2.0       | Wide tolerance - rare alerts (**RECOMMENDED**) |
+| `low`        | 1.5       | Catches significant staleness |
+| `medium`     | 1.0       | Balanced sensitivity |
+| `high`       | 0.75      | Tighter tolerance |
+| `very_high`  | 0.5       | Narrow tolerance - most sensitive (will be noisy) |
 
 **How it works:**
 - **Fully dynamic** - Adapts to any table size, growth rate, and load frequency (hourly, daily, weekly, etc.)
@@ -322,13 +314,13 @@ Control how strict the anomaly detection is using sigma multipliers.
 ```
 Expected Range = mean ± (sigma_multiplier × standard_deviation)
 
-Example with medium sensitivity (8σ):
+Example with medium sensitivity (8σ for growth rate):
 - Expected change: 3,300 rows/hour
 - Standard deviation: 2,156 rows
 - Lower threshold: 3,300 - (8.0 × 2,156) = -13,948 rows
 - Upper threshold: 3,300 + (8.0 × 2,156) = 20,548 rows
 - Statistical check: change < -13,948 OR change > 20,548
-- Materiality check: |deviation| > 1,000 rows AND relative change > 200%
+- Materiality check: |deviation| > 1,000 rows AND relative change > 200% (configurable)
 - Final anomaly: Both checks must pass
 ```
 
@@ -341,29 +333,17 @@ vars:
   # Volume Anomaly Detection
   volume_anomaly_detection:
     min_historical_observations: 7  # Minimum data points needed for baseline
+    # Materiality thresholds (prevents statistically significant but meaningless alerts)
+    materiality_change_rows: 1000   # Minimum absolute row deviation from expected change
+    materiality_change_pct: 2.0     # Minimum relative change (200%)
+    materiality_count_rows: 100     # Minimum absolute row deviation from expected count
+    materiality_count_pct: 0.05     # Minimum relative change (5%)
 
   # Freshness Anomaly Detection
   freshness_anomaly_detection:
     min_historical_observations: 7    # Minimum data points needed for baseline
     min_staleness_hours: 6            # Minimum hours stale to trigger alert (filters normal refresh lag)
     min_stddev_hours: 1.0             # Minimum standard deviation to enable detection (filters perfectly consistent tables)
-
-    # Optional: Override sigma multipliers (freshness detection defaults shown below)
-    # sensitivity_very_low: 10.0      # Forgiving tolerance (default)
-    # sensitivity_low: 6.0             # Moderate tolerance
-    # sensitivity_medium: 4.0          # Balanced sensitivity
-    # sensitivity_high: 2.5            # Tighter tolerance
-    # sensitivity_very_high: 1.5       # Narrow tolerance
-```
-
-**Example: Stricter freshness detection for your project:**
-
-```yaml
-vars:
-  freshness_anomaly_detection:
-    sensitivity_very_low: 6.0         # Override default 10.0σ to be more strict
-    sensitivity_low: 4.0              # Override default 6.0σ
-    min_staleness_hours: 2            # Alert after just 2 hours stale
 ```
 
 ### Per-Model Configuration
@@ -401,8 +381,10 @@ Each volume anomaly record includes **4 boolean flags**:
 - `is_row_count_anomaly` - Absolute row count out of expected range (size-based)
 - `is_anomaly` - **Master flag**: TRUE if ANY of the above is true
 
-**Human-readable column:**
-- `anomaly_reason` - Text: 'Unusual Spike', 'Unusual Drop', 'Row Count Too Low', 'Row Count Too High', or NULL
+**Human-readable columns:**
+- `row_count_change_anomaly_reason` - 'Row Count Change - Spike', 'Row Count Change - Dip', or NULL
+- `row_count_anomaly_reason` - 'Row Count - Spike', 'Row Count - Dip', or NULL
+- `anomaly_reason` - Combined (comma-separated if multiple types detected), or NULL
 
 **Query Examples:**
 
@@ -472,13 +454,13 @@ SELECT
   expected_row_count_mean,
   expected_row_count_min,
   expected_row_count_max,
-  is_growth_stalled,
   is_spike_high,
   is_drop_low,
   is_row_count_anomaly,
   anomaly_reason,
   sensitivity,
-  sigma_multiplier
+  row_count_change_sigma_multiplier,
+  row_count_sigma_multiplier
 FROM {{ ref('volume_metrics_history') }}
 WHERE is_anomaly = TRUE
 ORDER BY snapshot_timestamp DESC;
@@ -547,8 +529,8 @@ dbt_anomaly_detection/
 ├── macros/
 │   ├── volume_anomaly.sql                     # Generic test macro
 │   ├── freshness_anomaly.sql                  # Generic test macro
+│   ├── get_enrolled_tables.sql                # Shared graph-scanning macro
 │   └── detect_change_anomaly.sql              # Detection logic macros
-│       ├── is_growth_stalled()                # Detects stalled growth
 │       ├── is_spike_high()                    # Detects unusual spikes
 │       └── is_drop_low()                      # Detects unusual drops
 └── packages.yml                               # Dependencies (dbt_utils)

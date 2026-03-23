@@ -12,13 +12,14 @@ models:
       - Used by metrics models to determine which tables to monitor
 
       **How it works:**
-      1. Iterates through all test nodes in graph.nodes
-      2. Filters to tests with name = 'volume_anomaly' or 'freshness_anomaly'
-      3. Extracts the target model from dependencies, checking:
+      Uses the shared `get_enrolled_tables()` macro to:
+      1. Iterate through all test nodes in graph.nodes
+      2. Filter to tests with name = 'volume_anomaly' or 'freshness_anomaly'
+      3. Extract the target model from dependencies, checking:
          - `graph.sources` if dependency starts with "source."
          - `graph.nodes` for all other dependencies (models)
-      4. Captures database, schema, and table name from the node
-      5. Deduplicates (a table can have both volume and freshness tests)
+      4. Capture database, schema, and table name from the node
+      5. Deduplicate (a table can have both volume and freshness tests)
 
       **Cross-Database Support:** Fully supports source tables from external databases. Each source's database property is used to query the correct INFORMATION_SCHEMA.
 
