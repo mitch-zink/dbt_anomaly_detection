@@ -27,6 +27,10 @@ clean-targets:
 
 # Package configuration
 vars:
+  # Seasonality settings (apply to both volume and freshness)
+  seasonality_enabled: true          # Enable day-of-week seasonal baselines
+  min_seasonal_observations: 4       # Minimum per-DOW observations before using seasonal stats
+
   # Volume anomaly detection settings
   volume_anomaly_detection:
     # Minimum historical observations required for anomaly detection
