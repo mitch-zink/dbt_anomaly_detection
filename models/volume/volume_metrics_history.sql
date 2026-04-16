@@ -123,6 +123,8 @@
 {%- set mat_count_rows = var("volume_anomaly_detection.materiality_count_rows", 100) -%}
 {%- set mat_count_pct = var("volume_anomaly_detection.materiality_count_pct", 0.05) -%}
 {%- set min_obs = var("volume_anomaly_detection.min_historical_observations", 7) -%}
+{%- set seasonality_enabled = var('seasonality_enabled', true) -%}
+{%- set min_seasonal_obs = var('min_seasonal_observations', 4) -%}
 
 -- Query tables with custom timestamp columns (hourly granularity for backfill)
 with
@@ -391,9 +393,8 @@ with
             _loaded_at,
             row_count_change,
 
-            -- Calculate rolling statistics on the change column (28-day time window)
+            -- Base (non-seasonal) rolling statistics (28-day time window)
             -- Uses INTERVAL '1 second' PRECEDING to exclude current row from baseline
-            -- calculation
             avg(row_count_change) over (
                 partition by full_table_name, source_type
                 order by
@@ -401,7 +402,7 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as expected_change_mean,
+            ) as base_expected_change_mean,
 
             stddev(row_count_change) over (
                 partition by full_table_name, source_type
@@ -410,9 +411,8 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as expected_change_stddev,
+            ) as base_expected_change_stddev,
 
-            -- Calculate rolling statistics on ABSOLUTE row_count (28-day time window)
             avg(row_count) over (
                 partition by full_table_name, source_type
                 order by
@@ -420,7 +420,7 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as expected_row_count_mean,
+            ) as base_expected_row_count_mean,
 
             stddev(row_count) over (
                 partition by full_table_name, source_type
@@ -429,7 +429,7 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as expected_row_count_stddev,
+            ) as base_expected_row_count_stddev,
 
             count(*) over (
                 partition by full_table_name, source_type
@@ -438,9 +438,113 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as observation_count
+            ) as base_observation_count
+
+            {% if seasonality_enabled %}
+            ,
+            -- Seasonal (day-of-week partitioned) rolling statistics
+            -- Compares each day only to the same weekday in the lookback window
+            avg(row_count_change) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_expected_change_mean,
+
+            stddev(row_count_change) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_expected_change_stddev,
+
+            avg(row_count) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_expected_row_count_mean,
+
+            stddev(row_count) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_expected_row_count_stddev,
+
+            count(*) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_observation_count
+            {% endif %}
 
         from with_change
+    ),
+
+    -- Resolve seasonal vs base statistics
+    -- Falls back to base (non-seasonal) when insufficient day-of-week observations
+    resolved_stats as (
+        select
+            database_name,
+            schema_name,
+            table_name,
+            full_table_name,
+            row_count,
+            snapshot_timestamp,
+            source_type,
+            timestamp_column,
+            sensitivity,
+            row_count_change_sigma_multiplier,
+            row_count_sigma_multiplier,
+            _loaded_at,
+            row_count_change,
+
+            {% if seasonality_enabled %}
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_expected_change_mean
+                 else base_expected_change_mean
+            end as expected_change_mean,
+
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_expected_change_stddev
+                 else base_expected_change_stddev
+            end as expected_change_stddev,
+
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_expected_row_count_mean
+                 else base_expected_row_count_mean
+            end as expected_row_count_mean,
+
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_expected_row_count_stddev
+                 else base_expected_row_count_stddev
+            end as expected_row_count_stddev,
+
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_observation_count
+                 else base_observation_count
+            end as observation_count
+            {% else %}
+            base_expected_change_mean as expected_change_mean,
+            base_expected_change_stddev as expected_change_stddev,
+            base_expected_row_count_mean as expected_row_count_mean,
+            base_expected_row_count_stddev as expected_row_count_stddev,
+            base_observation_count as observation_count
+            {% endif %}
+
+        from change_stats
     ),
 
     -- Compute individual detection flags with materiality filters
@@ -664,7 +768,7 @@ with
             }} as metric_id,
             _loaded_at
 
-        from change_stats
+        from resolved_stats
     ),
 
     -- Derive is_anomaly and reason columns from individual flags

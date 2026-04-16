@@ -82,6 +82,9 @@
         "freshness_anomaly_detection.sensitivity_very_high", 0.5
     ),
 } -%}
+{%- set seasonality_enabled = var('seasonality_enabled', true) -%}
+{%- set min_seasonal_obs = var('min_seasonal_observations', 4) -%}
+{%- set min_obs = var("freshness_anomaly_detection.min_historical_observations", 7) -%}
 
 -- Generate hourly spine and query tables with custom timestamp columns
 with
@@ -383,10 +386,8 @@ with
             sigma_multiplier,
             _loaded_at,
 
-            -- Calculate rolling statistics (28-day time window)
+            -- Base (non-seasonal) rolling statistics (28-day time window)
             -- Uses INTERVAL '1 second' PRECEDING to exclude current row from baseline
-            -- calculation
-            -- (equivalent to ROWS BETWEEN ... AND 1 PRECEDING in row-based windows)
             avg(hours_since_last_update) over (
                 partition by full_table_name, source_type
                 order by
@@ -394,7 +395,7 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as expected_staleness_mean,
+            ) as base_expected_staleness_mean,
 
             stddev(hours_since_last_update) over (
                 partition by full_table_name, source_type
@@ -403,7 +404,7 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as expected_staleness_stddev,
+            ) as base_expected_staleness_stddev,
 
             count(*) over (
                 partition by full_table_name, source_type
@@ -412,9 +413,83 @@ with
                     range
                     between interval '28 days' preceding
                     and interval '1 second' preceding
-            ) as observation_count
+            ) as base_observation_count
+
+            {% if seasonality_enabled %}
+            ,
+            -- Seasonal (day-of-week partitioned) rolling statistics
+            avg(hours_since_last_update) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_expected_staleness_mean,
+
+            stddev(hours_since_last_update) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_expected_staleness_stddev,
+
+            count(*) over (
+                partition by full_table_name, source_type, dayofweek(snapshot_timestamp)
+                order by
+                    snapshot_timestamp
+                    range
+                    between interval '28 days' preceding
+                    and interval '1 second' preceding
+            ) as seasonal_observation_count
+            {% endif %}
 
         from with_history
+    ),
+
+    -- Resolve seasonal vs base statistics
+    -- Falls back to base (non-seasonal) when insufficient day-of-week observations
+    resolved_anomaly_stats as (
+        select
+            database_name,
+            schema_name,
+            table_name,
+            full_table_name,
+            table_created_at,
+            table_last_altered_at,
+            hours_since_last_update,
+            minutes_since_last_update,
+            snapshot_timestamp,
+            source_type,
+            timestamp_column,
+            sensitivity,
+            sigma_multiplier,
+            _loaded_at,
+
+            {% if seasonality_enabled %}
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_expected_staleness_mean
+                 else base_expected_staleness_mean
+            end as expected_staleness_mean,
+
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_expected_staleness_stddev
+                 else base_expected_staleness_stddev
+            end as expected_staleness_stddev,
+
+            case when seasonal_observation_count >= {{ min_seasonal_obs }}
+                 then seasonal_observation_count
+                 else base_observation_count
+            end as observation_count
+            {% else %}
+            base_expected_staleness_mean as expected_staleness_mean,
+            base_expected_staleness_stddev as expected_staleness_stddev,
+            base_observation_count as observation_count
+            {% endif %}
+
+        from anomaly_detection
     ),
 
     -- Add metric_id and anomaly flags
@@ -505,7 +580,7 @@ with
             }} as metric_id,
             _loaded_at
 
-        from anomaly_detection
+        from resolved_anomaly_stats
     )
 
 select *
