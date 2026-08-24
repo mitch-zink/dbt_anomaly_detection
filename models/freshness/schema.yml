@@ -74,20 +74,17 @@ models:
 
   - name: freshness_metrics_history_final
     description: |
-      Current-state freshness detection (percentile method). One row per object for
-      today's latest snapshot (snapshot_order = 1). A table is flagged stale when
-      `minutes_since_last_update > normal_gap_upper`, where normal_gap_upper is the
+      Freshness detection (percentile method). One row per (object, snapshot) across each
+      object's training window; the latest snapshot per object carries snapshot_order = 1
+      and is the current-state verdict downstream alerting reads. A table is flagged stale
+      when `minutes_since_last_update > normal_gap_upper`, where normal_gap_upper is the
       per-table percentile (chosen by sensitivity) of its normal gap between updates.
-      This is the source of truth the Prefect flow reads to maintain freshness alert
-      incidents (DS_MODELS.MODELS_OUTPUT.FRESHNESS_ALERTS).
+      This is the source of truth the Prefect flow reads (filtered to snapshot_order = 1)
+      to maintain freshness alert incidents (DS_MODELS.MODELS_OUTPUT.FRESHNESS_ALERTS).
     config:
       materialized: table
     data_tests:
-      # Grain guard: only the latest snapshot per object should survive the final filter.
-      - dbt_utils.expression_is_true:
-          arguments:
-            expression: "snapshot_order = 1"
-      # is_stale and is_training are documented as mutually exclusive.
+      # is_stale and is_training are mutually exclusive by construction.
       - dbt_utils.expression_is_true:
           arguments:
             expression: "not (is_stale and is_training)"
@@ -99,9 +96,8 @@ models:
       - name: object_id
         description: Stable per-object key = hash(full_table_name, source_type, timestamp_column).
         data_tests:
-          # One row per object at the latest snapshot -> object_id is the grain/PK.
+          # Repeats across snapshots (grain is object + snapshot), so not_null but not unique.
           - not_null
-          - unique
       - name: full_table_name
         description: DATABASE.SCHEMA.TABLE of the monitored table.
         data_tests:
@@ -168,14 +164,17 @@ models:
         data_tests:
           - not_null
       - name: snapshot_order
-        description: row_number() per object by snapshot_timestamp desc; 1 = latest (kept).
+        description: row_number() per object by snapshot_timestamp desc; 1 = latest (current-state verdict).
         data_tests:
           - not_null
       - name: metric_id
         description: |
-          Surrogate key inherited from prep (full_table_name + snapshot_timestamp +
-          source_type + timestamp_column). Unique per row, but object_id is the grain
-          here since only the latest snapshot per object survives.
+          Primary key / grain. Surrogate key inherited from prep (full_table_name +
+          snapshot_timestamp + source_type + timestamp_column) — one row per (object,
+          snapshot).
+        data_tests:
+          - not_null
+          - unique
       - name: _loaded_at
         description: ETL load timestamp inherited from prep.
       - name: database_name
