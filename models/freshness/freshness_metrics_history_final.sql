@@ -8,6 +8,8 @@
     "high": 0.85,
     "very_high": 0.80,
 } %}
+{% set min_obs = var("freshness_anomaly_detection.min_historical_observation_days", 7) %}
+{% set min_staleness_minutes = var("freshness_anomaly_detection.min_staleness_minutes", 120) %}
 
 with
     source as (
@@ -134,19 +136,9 @@ with
             case
                 when normal_gap_upper is null
                 then false
-                when
-                    observation_day_count
-                    <
-                    {{
-                        var(
-                            "freshness_anomaly_detection.min_historical_observation_days",
-                            7,
-                        )
-                    }}
+                when observation_day_count < {{ min_obs }}
                 then false
-                when
-                    minutes_since_last_update
-                    < {{ var("freshness_anomaly_detection.min_staleness_minutes", 120) }}
+                when minutes_since_last_update < {{ min_staleness_minutes }}
                 then false
                 when minutes_since_last_update > normal_gap_upper
                 then true
@@ -157,13 +149,7 @@ with
             -- pattern). Mutually exclusive with is_stale.
             (
                 normal_gap_upper is null
-                or observation_day_count
-                < {{
-                    var(
-                        "freshness_anomaly_detection.min_historical_observation_days",
-                        7,
-                    )
-                }}
+                or observation_day_count < {{ min_obs }}
             ) as is_training
         from scored
     )

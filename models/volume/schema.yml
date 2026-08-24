@@ -279,6 +279,12 @@ models:
     config:
       materialized: table
 
+    data_tests:
+      # is_row_count_change_anomaly and is_training are mutually exclusive by construction.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "not (is_row_count_change_anomaly and is_training)"
+
     columns:
       - name: metric_id
         description: Primary key. Surrogate key of (full_table_name, snapshot_timestamp, source_type, timestamp_column).
@@ -404,3 +410,12 @@ models:
           object; a count near 0 means it is novel. 0 when the row has a z-score
           but no qualifying prior snapshots; NULL only when the row has no
           baseline (no z-score).
+
+      - name: is_training
+        description: |
+          TRUE when the object doesn't yet have a trustworthy baseline — no MAD
+          (row_count_change_mad is NULL), or fewer than min_historical_observations
+          (default 7) prior observations behind the median/MAD. Mutually exclusive with
+          is_row_count_change_anomaly. Mirrors is_training in freshness_metrics_history_final.
+        tests:
+          - not_null

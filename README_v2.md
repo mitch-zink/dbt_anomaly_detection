@@ -38,8 +38,11 @@ kinds of problems using robust, self-calibrating statistical baselines:
 
 | Detector | Final model | Grain | Verdict column |
 |---|---|---|---|
-| Volume | `volume_metrics_history_final` | one row per (object, snapshot) | `is_row_count_change_anomaly` |
+| Volume | `volume_metrics_history_final` | one row per (object, snapshot) | `is_row_count_change_anomaly` / `is_training` |
 | Freshness | `freshness_metrics_history_final` | one row per (object, snapshot); the latest per object (`snapshot_order = 1`) is the current-state verdict | `is_stale` / `is_training` |
+
+Both detectors expose an `is_training` flag — TRUE when the object doesn't yet have a
+trustworthy baseline — which is mutually exclusive with the anomaly/stale verdict.
 
 An **object** is a monitored series, keyed by `object_id = hash(full_table_name,
 source_type, timestamp_column)`. A **metric** is one snapshot of an object, keyed by
@@ -190,7 +193,12 @@ row_count_change = row_count − row_count of the object's previous snapshot   (
    is_row_count_change_anomaly = row_count_change outside [lower, upper]
        AND row_count_change is not null
        AND prior_obs_count > min_historical_observations   (default 7)
+
+   is_training = row_count_change_mad is null            -- no baseline yet
+       OR prior_obs_count <= min_historical_observations  -- too few prior samples
    ```
+   `is_training` marks rows without a trustworthy baseline (mutually exclusive with
+   `is_row_count_change_anomaly`), mirroring the freshness field of the same name.
 
 Sensitivity maps to the **MAD multiplier** (a wider band = less sensitive):
 
@@ -265,7 +273,7 @@ select database_name, table_name, snapshot_timestamp, row_count, row_count_chang
        row_count_change_lower_limit, row_count_change_upper_limit,
        row_count_change_modified_z_score
 from {{ ref('volume_metrics_history_final') }}
-where is_row_count_change_anomaly
+where is_row_count_change_anomaly     -- exclude is_training rows (they never flag)
 order by snapshot_timestamp desc;
 
 -- Freshness: current stale tables
@@ -340,7 +348,9 @@ dbt build --select freshness_metrics_history_prep freshness_metrics_history_fina
 
 - **Warm-up / cold start.** New objects won't alert until they have a baseline: volume
   needs more than `min_historical_observations` prior samples; freshness needs
-  `min_historical_observation_days` distinct days and surfaces meanwhile via `is_training`.
+  `min_historical_observation_days` distinct days. Both surface warming-up objects via
+  `is_training` (mutually exclusive with the anomaly/stale verdict) so they can be tracked
+  separately instead of alerting on noise.
 - **Timestamp vs metadata mode.** Timestamp mode backfills history instantly from the
   table's own column and is immune to run-frequency gaps; metadata mode requires no config
   but only accumulates history as snapshots run. Switching a table's `timestamp_column`

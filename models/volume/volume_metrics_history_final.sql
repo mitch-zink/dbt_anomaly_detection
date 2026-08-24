@@ -217,7 +217,16 @@ with
                     row_count_change < row_count_change_lower_limit
                     or row_count_change > row_count_change_upper_limit
                 )
-            ) as is_row_count_change_anomaly
+            ) as is_row_count_change_anomaly,
+            -- Object is still "in training": not yet enough history to trust a
+            -- verdict (no baseline, or fewer than the required number of prior
+            -- observations behind the median/MAD). Mutually exclusive with
+            -- is_row_count_change_anomaly. Mirrors is_training in
+            -- freshness_metrics_history_final.
+            (
+                row_count_change_mad is null
+                or coalesce(prior_obs_count, 0) <= {{ min_obs }}
+            ) as is_training
         from bounds
         left join similar_z_score using (metric_id)
     )
