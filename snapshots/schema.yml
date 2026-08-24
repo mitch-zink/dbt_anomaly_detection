@@ -39,26 +39,26 @@ snapshots:
         description: |
           Unique identifier for snapshot tracking (surrogate key).
           Generated from: md5(table_catalog || table_schema || table_name)
-        tests:
+        data_tests:
           - not_null
           - unique:
               where: "dbt_valid_to is null"
 
       - name: table_catalog
         description: Database/catalog name
-        tests:
+        data_tests:
           - not_null:
               where: "dbt_valid_to is null"
 
       - name: table_schema
         description: Schema name
-        tests:
+        data_tests:
           - not_null:
               where: "dbt_valid_to is null"
 
       - name: table_name
         description: Table name (BASE TABLEs only)
-        tests:
+        data_tests:
           - not_null:
               where: "dbt_valid_to is null"
 
@@ -67,7 +67,7 @@ snapshots:
 
       - name: table_type
         description: Type of table (only BASE TABLEs are included)
-        tests:
+        data_tests:
           - not_null:
               where: "dbt_valid_to is null"
           - accepted_values:
@@ -84,7 +84,7 @@ snapshots:
         description: |
           Approximate number of rows in the table.
           Used for volume anomaly detection.
-        tests:
+        data_tests:
           - not_null:
               where: "dbt_valid_to is null"
           - dbt_utils.expression_is_true:
@@ -108,7 +108,7 @@ snapshots:
           Timestamp when table was last altered/updated.
           Cast to TIMESTAMP_NTZ for snapshot compatibility.
           Used as snapshot updated_at column and for freshness anomaly detection.
-        tests:
+        data_tests:
           - not_null:
               where: "dbt_valid_to is null"
 
@@ -187,7 +187,7 @@ snapshots:
         description: |
           Snapshot metadata: timestamp when this version became valid.
           Automatically added by dbt snapshot.
-        tests:
+        data_tests:
           - not_null
 
       - name: dbt_valid_to
@@ -200,5 +200,5 @@ snapshots:
         description: |
           Snapshot metadata: value of updated_at column (last_altered).
           Automatically added by dbt snapshot.
-        tests:
+        data_tests:
           - not_null

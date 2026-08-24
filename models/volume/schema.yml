@@ -50,33 +50,33 @@ models:
     columns:
       - name: metric_id
         description: Unique identifier for this metric snapshot (surrogate key)
-        tests:
+        data_tests:
           - not_null
           - unique
 
       - name: database_name
         description: Database/catalog name
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table)
-        tests:
+        data_tests:
           - not_null
 
       - name: row_count
         description: Number of rows in the table at snapshot time
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -84,7 +84,7 @@ models:
 
       - name: snapshot_timestamp
         description: Exact timestamp when snapshot was taken
-        tests:
+        data_tests:
           - not_null
 
       - name: source_type
@@ -92,7 +92,7 @@ models:
           Source of the metric data:
           - 'table': Direct table query using custom timestamp column
           - 'metadata': Information schema row_count metadata
-        tests:
+        data_tests:
           - not_null
           - accepted_values:
               arguments:
@@ -105,7 +105,7 @@ models:
 
       - name: _loaded_at
         description: ETL load timestamp
-        tests:
+        data_tests:
           - not_null
 
       - name: expected_row_count_mean
@@ -201,7 +201,7 @@ models:
     columns:
       - name: metric_id
         description: Primary key. Surrogate key of (full_table_name, snapshot_timestamp, source_type, timestamp_column).
-        tests:
+        data_tests:
           - not_null
           - unique
 
@@ -209,7 +209,7 @@ models:
         description: |
           Surrogate key of (full_table_name, source_type, timestamp_column). Identifies
           the monitored series; the downstream baseline pool is partitioned on this.
-        tests:
+        data_tests:
           - not_null
 
       - name: _loaded_at
@@ -288,7 +288,7 @@ models:
     columns:
       - name: metric_id
         description: Primary key. Surrogate key of (full_table_name, snapshot_timestamp, source_type, timestamp_column).
-        tests:
+        data_tests:
           - not_null
           - unique
 
@@ -296,37 +296,37 @@ models:
         description: |
           Surrogate key of (full_table_name, source_type, timestamp_column). Identifies
           the monitored series; the prior-rows baseline pool is partitioned on this.
-        tests:
+        data_tests:
           - not_null
 
       - name: _loaded_at
         description: ETL load timestamp (stamped once in the prep final CTE).
-        tests:
+        data_tests:
           - not_null
 
       - name: database_name
         description: Database/catalog name.
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name.
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name.
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table).
-        tests:
+        data_tests:
           - not_null
 
       - name: row_count
         description: Row count of the monitored table at snapshot time.
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -339,7 +339,7 @@ models:
 
       - name: snapshot_timestamp
         description: Hourly snapshot timestamp.
-        tests:
+        data_tests:
           - not_null
 
       - name: source_type
@@ -347,7 +347,7 @@ models:
           Source of the metric:
           - 'table': custom timestamp-column backfill (staging)
           - 'metadata': information_schema row_count snapshot
-        tests:
+        data_tests:
           - not_null
           - accepted_values:
               arguments:
@@ -358,7 +358,7 @@ models:
 
       - name: sensitivity
         description: Configured sensitivity level for the object.
-        tests:
+        data_tests:
           - not_null
           - accepted_values:
               arguments:
@@ -366,7 +366,7 @@ models:
 
       - name: row_count_change_mad_multiplier
         description: Number of MADs used to set the row_count_change band (from the sensitivity map).
-        tests:
+        data_tests:
           - not_null
 
       - name: prior_obs_count
@@ -398,7 +398,7 @@ models:
           TRUE when row_count_change falls outside
           [row_count_change_lower_limit, row_count_change_upper_limit].
           FALSE when there is no baseline, row_count_change is NULL, or within the band.
-        tests:
+        data_tests:
           - not_null
 
       - name: row_count_change_similar_z_score_count
@@ -417,5 +417,5 @@ models:
           (row_count_change_mad is NULL), or fewer than min_historical_observations
           (default 7) prior observations behind the median/MAD. Mutually exclusive with
           is_row_count_change_anomaly. Mirrors is_training in freshness_metrics_history_final.
-        tests:
+        data_tests:
           - not_null

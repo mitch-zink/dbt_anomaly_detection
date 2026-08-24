@@ -34,22 +34,22 @@ models:
     columns:
       - name: database_name
         description: Database name
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table)
-        tests:
+        data_tests:
           - not_null
           - unique
 
@@ -85,27 +85,27 @@ models:
     columns:
       - name: database_name
         description: Database name (uppercased)
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name (uppercased)
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name (uppercased)
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table), uppercased
-        tests:
+        data_tests:
           - not_null
 
       - name: row_count
         description: Cumulative row count as of the hourly snapshot (base count + running sum of hourly counts)
-        tests:
+        data_tests:
           - not_null
 
       - name: row_count_change
@@ -113,7 +113,7 @@ models:
 
       - name: snapshot_timestamp
         description: Hourly snapshot timestamp (date_trunc('hour', timestamp_column))
-        tests:
+        data_tests:
           - not_null
 
       - name: source_type
@@ -134,7 +134,7 @@ models:
           (1 = most recent). The prep model drops snapshot_nth_order = 1 because the latest
           hour bucket is still incomplete.
 
-    tests:
+    data_tests:
       - dbt_utils.unique_combination_of_columns:
           combination_of_columns:
             - full_table_name

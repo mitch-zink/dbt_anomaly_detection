@@ -243,28 +243,28 @@ models:
     columns:
       - name: metric_id
         description: Unique identifier for this metric snapshot (surrogate key)
-        tests:
+        data_tests:
           - not_null
           - unique
 
       - name: database_name
         description: Database/catalog name
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table)
-        tests:
+        data_tests:
           - not_null
 
       - name: table_created_at
@@ -275,12 +275,12 @@ models:
 
       - name: table_last_altered_at
         description: When the table was last altered/updated
-        tests:
+        data_tests:
           - not_null
 
       - name: hours_since_last_update
         description: Hours since the table was last updated (staleness metric)
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -288,7 +288,7 @@ models:
 
       - name: minutes_since_last_update
         description: Minutes since the table was last updated (finer granularity)
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -296,7 +296,7 @@ models:
 
       - name: snapshot_timestamp
         description: Exact timestamp when snapshot was taken
-        tests:
+        data_tests:
           - not_null
 
       - name: source_type
@@ -304,7 +304,7 @@ models:
           Source of the metric data:
           - 'table': Direct table query using custom timestamp column
           - 'metadata': Information schema LAST_ALTERED metadata
-        tests:
+        data_tests:
           - not_null
           - accepted_values:
               arguments:
@@ -317,7 +317,7 @@ models:
 
       - name: _loaded_at
         description: ETL load timestamp
-        tests:
+        data_tests:
           - not_null
 
       - name: expected_staleness_mean
