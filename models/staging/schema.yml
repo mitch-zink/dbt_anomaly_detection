@@ -27,9 +27,6 @@ models:
 
       **Build frequency:** Should be run before snapshot on every dbt run to capture newly enrolled tables.
 
-      **Full-refresh protected**: Ignores --full-refresh to prevent disruption (rarely needs rebuild).
-      Override only if needed: --vars '{allow_full_refresh_anomaly_detection: true}'
-
     config:
       tags: ['anomaly_detection', 'metadata']
       materialized: table
@@ -58,3 +55,89 @@ models:
 
       - name: _loaded_at
         description: Timestamp when this record was loaded
+
+  - name: stg_volumn_metric_custom_table
+    description: |
+      **Custom-Timestamp Volume Metrics** - Hourly row-count metrics for tables enrolled in
+      `volume_anomaly` with a `timestamp_column` argument.
+
+      **Purpose:**
+      - For each enrolled custom table, builds an hourly cumulative row_count series over the
+        configured lookback window using the table's own timestamp column (rather than
+        INFORMATION_SCHEMA row counts).
+      - Feeds the downstream volume anomaly baseline/history for timestamp-based monitoring.
+
+      **How it works:**
+      Uses the shared `get_enrolled_tables()` macro to find tables whose `volume_anomaly` test
+      declares a `timestamp_column`. For each table it:
+      1. Counts all rows before the lookback window (base count).
+      2. Buckets rows within the window into hourly counts on the timestamp column.
+      3. Emits a cumulative row_count = base count + running sum of hourly counts.
+
+      **Adjustable lookback:** The lookback window is controlled per-table by the
+      `training_period_days` argument on the `volume_anomaly` test (defaults to 30 days).
+      Set it in the enrolled table's `schema.yml`, e.g.:
+      `- dbt_anomaly_detection.volume_anomaly: {timestamp_column: created_at, training_period_days: 60}`
+
+      Each row is one (table, hourly snapshot). Sensitivity is mapped to a MAD multiplier from
+      project vars. When no custom-timestamp tables are enrolled the model returns an empty result.
+
+    columns:
+      - name: database_name
+        description: Database name (uppercased)
+        tests:
+          - not_null
+
+      - name: schema_name
+        description: Schema name (uppercased)
+        tests:
+          - not_null
+
+      - name: table_name
+        description: Table name (uppercased)
+        tests:
+          - not_null
+
+      - name: full_table_name
+        description: Fully qualified table name (database.schema.table), uppercased
+        tests:
+          - not_null
+
+      - name: row_count
+        description: Cumulative row count as of the hourly snapshot (base count + running sum of hourly counts)
+        tests:
+          - not_null
+
+      - name: row_count_change
+        description: Rows added in this hourly bucket (the bucket's own hourly count; the period delta).
+
+      - name: snapshot_timestamp
+        description: Hourly snapshot timestamp (date_trunc('hour', timestamp_column))
+        tests:
+          - not_null
+
+      - name: source_type
+        description: Metric source type. Always 'table' for custom-timestamp metrics.
+
+      - name: timestamp_column
+        description: The table's timestamp column used to bucket rows into hourly snapshots.
+
+      - name: sensitivity
+        description: Configured sensitivity level (very_low, low, medium, high, very_high).
+
+      - name: row_count_change_mad_multiplier
+        description: MAD multiplier applied to row_count_change anomaly detection downstream, derived from sensitivity.
+
+      - name: snapshot_nth_order
+        description: |
+          row_number() per (full_table_name, timestamp_column) by snapshot_timestamp desc
+          (1 = most recent). The prep model drops snapshot_nth_order = 1 because the latest
+          hour bucket is still incomplete.
+
+    tests:
+      - dbt_utils.unique_combination_of_columns:
+          combination_of_columns:
+            - full_table_name
+            - snapshot_timestamp
+            - source_type
+            - timestamp_column

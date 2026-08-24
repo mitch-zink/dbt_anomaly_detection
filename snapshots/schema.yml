@@ -34,16 +34,6 @@ snapshots:
       extracted from dbt's graph (node.database for models, source.database for sources) at compile time,
       ensuring environment consistency. See inline comments in snapshot SQL for full justification.
 
-      **Full-refresh protected**: Ignores --full-refresh by default to prevent loss of Type 2 SCD history.
-      (Override: --vars '{allow_full_refresh_anomaly_detection: true}')
-
-    config:
-      target_schema: dbt_anomaly_detection
-      unique_key: table_id
-      strategy: check
-      check_cols: ["created", "last_altered", "snapshot_timestamp"]
-      invalidate_hard_deletes: true
-
     columns:
       - name: table_id
         description: |

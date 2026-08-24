@@ -1,12 +1,4 @@
-{{
-    config(
-        materialized="table",
-        tags=["anomaly_detection", "metadata"],
-        full_refresh=(
-            false if not var("allow_full_refresh_anomaly_detection", false) else none
-        ),
-    )
-}}
+{{ config(materialized="table", tags=["anomaly_detection", "metadata"]) }}
 
 /*
     Staging: Monitored Tables
@@ -23,9 +15,6 @@
     FIVETRAN_HEAP_DB). Each source's database property is captured and used to query
     the correct INFORMATION_SCHEMA.
 
-    **Full Refresh Protection:**
-    This model ignores --full-refresh flag by default to prevent accidental rebuilds.
-    Override: dbt run --select stg_monitored_tables --vars '{allow_full_refresh_anomaly_detection: true}'
 
     This model serves as the enrollment registry - only tables appearing here will be
     tracked by the snap_monitored_table_metadata snapshot.
