@@ -60,7 +60,7 @@
                 "full_name": t.full_name,
                 "sensitivity": t.kwargs.get("sensitivity", "medium"),
                 "training_period_days": t.kwargs.get(
-                    "training_period_days", 30
+                    "training_period_days", 90
                 ),
             }
         ) -%}
