@@ -50,33 +50,33 @@ models:
     columns:
       - name: metric_id
         description: Unique identifier for this metric snapshot (surrogate key)
-        tests:
+        data_tests:
           - not_null
           - unique
 
       - name: database_name
         description: Database/catalog name
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table)
-        tests:
+        data_tests:
           - not_null
 
       - name: row_count
         description: Number of rows in the table at snapshot time
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -84,7 +84,7 @@ models:
 
       - name: snapshot_timestamp
         description: Exact timestamp when snapshot was taken
-        tests:
+        data_tests:
           - not_null
 
       - name: source_type
@@ -92,7 +92,7 @@ models:
           Source of the metric data:
           - 'table': Direct table query using custom timestamp column
           - 'metadata': Information schema row_count metadata
-        tests:
+        data_tests:
           - not_null
           - accepted_values:
               arguments:
@@ -105,7 +105,7 @@ models:
 
       - name: _loaded_at
         description: ETL load timestamp
-        tests:
+        data_tests:
           - not_null
 
       - name: expected_row_count_mean
@@ -187,3 +187,235 @@ models:
           - 'Row Count Change - Spike'
           - 'Row Count - Dip'
           - 'Row Count Change - Spike, Row Count - Spike'
+
+  - name: volume_metrics_history_prep
+    description: |
+      Dual-source per-snapshot volume history, one row per (object, snapshot). Unions
+      custom-timestamp row-count series (stg_volumn_metric_custom_table, source_type
+      'table') with INFORMATION_SCHEMA row counts from snap_monitored_table_metadata
+      (source_type 'metadata'), stamps surrogate keys, and derives row_count_change as
+      the lag difference vs the object's previous snapshot. Feeds
+      volume_metrics_history_final, which builds the baseline and scores anomalies.
+    config:
+      materialized: table
+    columns:
+      - name: metric_id
+        description: Primary key. Surrogate key of (full_table_name, snapshot_timestamp, source_type, timestamp_column).
+        data_tests:
+          - not_null
+          - unique
+
+      - name: object_id
+        description: |
+          Surrogate key of (full_table_name, source_type, timestamp_column). Identifies
+          the monitored series; the downstream baseline pool is partitioned on this.
+        data_tests:
+          - not_null
+
+      - name: _loaded_at
+        description: ETL load timestamp (current_timestamp() stamped in the final CTE).
+
+      - name: database_name
+        description: Database/catalog name (uppercased).
+
+      - name: schema_name
+        description: Schema name (uppercased).
+
+      - name: table_name
+        description: Table name (uppercased).
+
+      - name: full_table_name
+        description: Fully qualified table name (database.schema.table), uppercased.
+
+      - name: row_count
+        description: |
+          Row count at snapshot time. Cumulative for custom-timestamp ('table') sources;
+          INFORMATION_SCHEMA row_count for 'metadata' sources.
+
+      - name: snapshot_timestamp
+        description: Hourly snapshot timestamp.
+
+      - name: source_type
+        description: |
+          Source of the metric:
+          - 'table': custom timestamp-column backfill (stg_volumn_metric_custom_table)
+          - 'metadata': information_schema row_count snapshot
+
+      - name: timestamp_column
+        description: Timestamp column used for 'table' sources; NULL for 'metadata'.
+
+      - name: sensitivity
+        description: Configured sensitivity level (very_low, low, medium, high, very_high).
+
+      - name: row_count_change_mad_multiplier
+        description: Number of MADs used downstream to set the row_count_change band (from the sensitivity map).
+
+      - name: row_count_change
+        description: |
+          Change in row_count vs the object's previous snapshot (lag difference; may be
+          negative if rows were deleted). NULL for an object's first snapshot, and 0 is
+          converted to NULL so flat snapshots are excluded from the downstream MED/MAD.
+
+  - name: volume_metrics_history_final
+    description: |
+      Robust (median/MAD) volume anomaly scoring, one row per object per snapshot.
+
+      For each snapshot row a baseline is built from that object's PRIOR snapshots only
+      (a row is never part of its own baseline). Rather than all history, the baseline
+      pool is the med_sample_size prior snapshots whose row_count_change is NEAREST to
+      the current row's change. row_count_change is scored against a
+      MED +/- row_count_change_mad_multiplier * MAD band, where MED is the median of
+      that nearest prior pool and MAD = median(|value - MED|) (floored so a burst-loading
+      table never collapses the band to zero width). MAD is used directly as the spread
+      unit, so the multiplier is a number of MADs (not sigmas).
+
+      A row is flagged when row_count_change falls outside
+      [row_count_change_lower_limit, row_count_change_upper_limit].
+
+      Note: this is anomaly-detection infrastructure, so it is intentionally NOT enrolled
+      in the volume_anomaly / freshness_anomaly tests (that would be self-referential),
+      consistent with volume_metrics_history above.
+
+    config:
+      materialized: table
+
+    data_tests:
+      # is_row_count_change_anomaly and is_training are mutually exclusive by construction.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "not (is_row_count_change_anomaly and is_training)"
+
+    columns:
+      - name: metric_id
+        description: Primary key. Surrogate key of (full_table_name, snapshot_timestamp, source_type, timestamp_column).
+        data_tests:
+          - not_null
+          - unique
+
+      - name: object_id
+        description: |
+          Surrogate key of (full_table_name, source_type, timestamp_column). Identifies
+          the monitored series; the prior-rows baseline pool is partitioned on this.
+        data_tests:
+          - not_null
+
+      - name: _loaded_at
+        description: ETL load timestamp (stamped once in the prep final CTE).
+        data_tests:
+          - not_null
+
+      - name: database_name
+        description: Database/catalog name.
+        data_tests:
+          - not_null
+
+      - name: schema_name
+        description: Schema name.
+        data_tests:
+          - not_null
+
+      - name: table_name
+        description: Table name.
+        data_tests:
+          - not_null
+
+      - name: full_table_name
+        description: Fully qualified table name (database.schema.table).
+        data_tests:
+          - not_null
+
+      - name: row_count
+        description: Row count of the monitored table at snapshot time.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0"
+
+      - name: row_count_change
+        description: |
+          Change in row_count vs the object's previous snapshot (lag difference; may be
+          negative if rows were deleted). NULL for an object's first snapshot.
+
+      - name: snapshot_timestamp
+        description: Hourly snapshot timestamp.
+        data_tests:
+          - not_null
+
+      - name: source_type
+        description: |
+          Source of the metric:
+          - 'table': custom timestamp-column backfill (staging)
+          - 'metadata': information_schema row_count snapshot
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['table', 'metadata']
+
+      - name: timestamp_column
+        description: Timestamp column used for 'table' sources; NULL for 'metadata'.
+
+      - name: sensitivity
+        description: Configured sensitivity level for the object.
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['very_low', 'low', 'medium', 'high', 'very_high']
+
+      - name: row_count_change_mad_multiplier
+        description: Number of MADs used to set the row_count_change band (from the sensitivity map).
+        data_tests:
+          - not_null
+
+      - name: prior_obs_count
+        description: |
+          Number of prior snapshots in this row's baseline pool. NULL for an object's
+          first snapshot (no prior rows, hence no baseline).
+
+      - name: row_count_change_med
+        description: Median row_count_change of the prior-rows pool. NULL when there is no baseline.
+
+      - name: row_count_change_mad
+        description: Median absolute deviation of prior-pool row_count_change. NULL when there is no baseline.
+
+      - name: row_count_change_lower_limit
+        description: "Lower band: row_count_change_med - row_count_change_mad_multiplier * row_count_change_mad."
+
+      - name: row_count_change_upper_limit
+        description: "Upper band: row_count_change_med + row_count_change_mad_multiplier * row_count_change_mad."
+
+      - name: row_count_change_modified_z_score
+        description: |
+          Distance of row_count_change from the baseline median in MAD units:
+          abs(row_count_change - row_count_change_med) / row_count_change_mad. A
+          diagnostic of how far outside the band a value sits. NULL when there is
+          no baseline or row_count_change is NULL.
+
+      - name: is_row_count_change_anomaly
+        description: |
+          TRUE when row_count_change falls outside
+          [row_count_change_lower_limit, row_count_change_upper_limit].
+          FALSE when there is no baseline, row_count_change is NULL, or within the band.
+        data_tests:
+          - not_null
+
+      - name: row_count_change_similar_z_score_count
+        description: |
+          Count of PRIOR snapshots of the same object whose
+          row_count_change_modified_z_score is within +/-20% of this row's z-score
+          (i.e. in [z * 0.8, z * 1.2]). Prior-only, so a row never counts itself.
+          A high count means a deviation of this magnitude is routine for the
+          object; a count near 0 means it is novel. 0 when the row has a z-score
+          but no qualifying prior snapshots; NULL only when the row has no
+          baseline (no z-score).
+
+      - name: is_training
+        description: |
+          TRUE when the object doesn't yet have a trustworthy baseline — no MAD
+          (row_count_change_mad is NULL), or fewer than min_historical_observations
+          (default 7) prior observations behind the median/MAD. Mutually exclusive with
+          is_row_count_change_anomaly. Mirrors is_training in freshness_metrics_history_final.
+        data_tests:
+          - not_null

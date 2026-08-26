@@ -2,17 +2,11 @@
 
     {{
         config(
-            target_schema="dbt_anomaly_detection",
             unique_key="table_id",
             strategy="check",
             check_cols=["created", "last_altered", "row_count"],
             invalidate_hard_deletes=True,
             tags=["anomaly_detection", "snapshot", "metadata"],
-            full_refresh=(
-                false
-                if not var("allow_full_refresh_anomaly_detection", false)
-                else none
-            ),
         )
     }}
 

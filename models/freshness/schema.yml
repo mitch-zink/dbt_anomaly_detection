@@ -1,6 +1,214 @@
 version: 2
 
 models:
+  - name: stg_freshness_metric_custom_table
+    description: |
+      Periodic (per-run) snapshot of the MAX(timestamp_column) for every enrolled
+      table that declares a custom `timestamp_column` on its freshness_anomaly test.
+      Provides an event-time freshness signal for tables whose real update time is a
+      data column rather than INFORMATION_SCHEMA.LAST_ALTERED. Incremental, full-refresh
+      disabled to preserve history.
+    config:
+      materialized: incremental
+      unique_key: _snapshot_id
+    columns:
+      - name: _snapshot_id
+        description: Surrogate key for this snapshot row (full_table_name + snapshot time).
+      - name: database_name
+        description: Database name (uppercased).
+      - name: schema_name
+        description: Schema name (uppercased).
+      - name: table_name
+        description: Table name (uppercased).
+      - name: full_table_name
+        description: DATABASE.SCHEMA.TABLE of the monitored table.
+      - name: snapshot_timestamp
+        description: Hour-truncated time this freshness reading was captured.
+      - name: table_last_timestamp
+        description: MAX(timestamp_column) observed — the table's true last-updated event time.
+      - name: sensitivity
+        description: Sensitivity level from the freshness_anomaly test config.
+      - name: timestamp_column
+        description: The table's event-time column used to measure freshness.
+      - name: training_period_days
+        description: Lookback window (days) for the baseline, from the freshness_anomaly test config.
+
+  - name: freshness_metrics_history_prep
+    description: |
+      Dual-source freshness history (per snapshot, ~31-day window). Unions custom
+      event-time readings (stg_freshness_metric_custom_table) with INFORMATION_SCHEMA
+      LAST_ALTERED readings (snap_monitored_table_metadata). One row per object per
+      snapshot; feeds freshness_metrics_history_final.
+    config:
+      materialized: incremental
+      unique_key: metric_id
+    columns:
+      - name: metric_id
+        description: Surrogate key (full_table_name + snapshot_timestamp + source_type + timestamp_column).
+      - name: object_id
+        description: Stable per-object key = hash(full_table_name, source_type, timestamp_column).
+      - name: _loaded_at
+        description: ETL load timestamp (current_timestamp() stamped in the final CTE).
+      - name: database_name
+        description: Database name (uppercased).
+      - name: schema_name
+        description: Schema name (uppercased).
+      - name: table_name
+        description: Table name (uppercased).
+      - name: full_table_name
+        description: DATABASE.SCHEMA.TABLE of the monitored table.
+      - name: table_created_at
+        description: Table creation time (from INFORMATION_SCHEMA); NULL for custom-timestamp ('table') sources.
+      - name: table_last_altered_at
+        description: Table's last actual update time (event-time for 'table', LAST_ALTERED for 'metadata').
+      - name: snapshot_timestamp
+        description: When this freshness reading was captured.
+      - name: source_type
+        description: "'table' (custom event-time column) or 'metadata' (INFORMATION_SCHEMA)."
+      - name: timestamp_column
+        description: The table's event-time column for 'table' sources; NULL for 'metadata'.
+      - name: sensitivity
+        description: Sensitivity level from the freshness_anomaly test config.
+      - name: training_period_days
+        description: Lookback window (days) for the baseline, from the freshness_anomaly test config.
+
+  - name: freshness_metrics_history_final
+    description: |
+      Freshness detection (percentile method). One row per (object, snapshot) across each
+      object's training window; the latest snapshot per object carries snapshot_order = 1
+      and is the current-state verdict downstream alerting reads. A table is flagged stale
+      when `minutes_since_last_update > normal_gap_upper`, where normal_gap_upper is the
+      per-table percentile (chosen by sensitivity) of its normal gap between updates.
+      This is the source of truth the Prefect flow reads (filtered to snapshot_order = 1)
+      to maintain freshness alert incidents (DS_MODELS.MODELS_OUTPUT.FRESHNESS_ALERTS).
+    config:
+      materialized: table
+    data_tests:
+      # is_stale and is_training are mutually exclusive by construction.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "not (is_stale and is_training)"
+      # A stale verdict requires a baseline; it can never fire while normal_gap_upper is NULL.
+      - dbt_utils.expression_is_true:
+          arguments:
+            expression: "not (is_stale and normal_gap_upper is null)"
+    columns:
+      - name: object_id
+        description: Stable per-object key = hash(full_table_name, source_type, timestamp_column).
+        data_tests:
+          # Repeats across snapshots (grain is object + snapshot), so not_null but not unique.
+          - not_null
+      - name: full_table_name
+        description: DATABASE.SCHEMA.TABLE of the monitored table.
+        data_tests:
+          - not_null
+      - name: source_type
+        description: "'table' (custom event-time column) or 'metadata' (INFORMATION_SCHEMA)."
+        data_tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['table', 'metadata']
+      - name: sensitivity
+        description: Sensitivity level driving the percentile (very_low=0.95 … very_high=0.80).
+        data_tests:
+          - not_null
+      - name: minutes_since_last_update
+        description: Staleness — minutes between table_last_altered_at and snapshot_timestamp.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0"
+      - name: normal_gap_upper
+        description: |
+          Per-table upper bound (minutes): percentile_cont(sensitivity_pct) of the
+          historical minutes_between_updates_adjusted, partitioned by object_id.
+          NULL until the object has a baseline.
+        data_tests:
+          # Nullable (no baseline yet), but when present it must be a non-negative gap.
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0"
+              config:
+                where: "normal_gap_upper is not null"
+      - name: normal_gap_upper_hour
+        description: normal_gap_upper expressed in hours (decimal(5,1)) for reporting.
+      - name: observation_day_count
+        description: |
+          Distinct calendar days with at least one non-null normal-gap sample for this
+          object. Guards is_stale — snapshots are sub-daily, so we require days of
+          pattern (not raw sample count) before trusting the baseline.
+        data_tests:
+          - not_null
+          - dbt_utils.expression_is_true:
+              arguments:
+                expression: ">= 0"
+      - name: is_stale
+        description: |
+          **FRESHNESS ISSUE FLAG.** True when the table is overdue relative to its own
+          normal update gap. Computed as:
+          - false: normal_gap_upper is NULL (no baseline yet)
+          - false: observation_day_count < min_historical_observation_days (default 7)
+          - false: minutes_since_last_update < min_staleness_minutes (default 120 = 2h floor)
+          - true:  minutes_since_last_update > normal_gap_upper (OVERDUE)
+          - false: otherwise (within normal range)
+        data_tests:
+          - not_null
+      - name: is_training
+        description: |
+          True when the object doesn't yet have a trustworthy baseline — no
+          normal_gap_upper, or fewer than min_historical_observation_days (default 7)
+          distinct days of history. Mutually exclusive with is_stale. Surfaced by the
+          Prefect flow as the "in training" alert bucket.
+        data_tests:
+          - not_null
+      - name: snapshot_order
+        description: row_number() per object by snapshot_timestamp desc; 1 = latest (current-state verdict).
+        data_tests:
+          - not_null
+      - name: metric_id
+        description: |
+          Primary key / grain. Surrogate key inherited from prep (full_table_name +
+          snapshot_timestamp + source_type + timestamp_column) — one row per (object,
+          snapshot).
+        data_tests:
+          - not_null
+          - unique
+      - name: _loaded_at
+        description: ETL load timestamp inherited from prep.
+      - name: database_name
+        description: Database name (uppercased).
+      - name: schema_name
+        description: Schema name (uppercased).
+      - name: table_name
+        description: Table name (uppercased).
+      - name: table_created_at
+        description: Table creation time (from INFORMATION_SCHEMA); NULL for custom-timestamp ('table') sources.
+      - name: table_last_altered_at
+        description: Table's last actual update time (event-time for 'table', LAST_ALTERED for 'metadata').
+      - name: snapshot_timestamp
+        description: When this (latest) freshness reading was captured.
+      - name: timestamp_column
+        description: The table's event-time column for 'table' sources; NULL for 'metadata'.
+      - name: training_period_days
+        description: Lookback window (days) used to filter the training history, from the freshness_anomaly test config.
+      - name: minutes_between_updates
+        description: |
+          Raw minutes between this snapshot's table_last_altered_at and the object's
+          previous snapshot's table_last_altered_at (lag per object).
+      - name: minutes_between_snapshot
+        description: Minutes between this snapshot and the object's previous snapshot (lag per object).
+      - name: update_observation_seq
+        description: |
+          Ordinal of this snapshot among all snapshots that observed the SAME
+          table_last_altered_at for this object (1 = first snapshot to see the update).
+      - name: minutes_between_updates_adjusted
+        description: |
+          minutes_between_updates with re-observations and unusable gaps nulled out
+          (snapshots >24h apart, gaps <30min, or update_observation_seq > 1). This is the
+          sample that feeds the normal_gap_upper percentile baseline.
+
   - name: freshness_metrics_history
     description: |
       Incremental snapshot of freshness metrics for all tables in the database.
@@ -35,28 +243,28 @@ models:
     columns:
       - name: metric_id
         description: Unique identifier for this metric snapshot (surrogate key)
-        tests:
+        data_tests:
           - not_null
           - unique
 
       - name: database_name
         description: Database/catalog name
-        tests:
+        data_tests:
           - not_null
 
       - name: schema_name
         description: Schema name
-        tests:
+        data_tests:
           - not_null
 
       - name: table_name
         description: Table name
-        tests:
+        data_tests:
           - not_null
 
       - name: full_table_name
         description: Fully qualified table name (database.schema.table)
-        tests:
+        data_tests:
           - not_null
 
       - name: table_created_at
@@ -67,12 +275,12 @@ models:
 
       - name: table_last_altered_at
         description: When the table was last altered/updated
-        tests:
+        data_tests:
           - not_null
 
       - name: hours_since_last_update
         description: Hours since the table was last updated (staleness metric)
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -80,7 +288,7 @@ models:
 
       - name: minutes_since_last_update
         description: Minutes since the table was last updated (finer granularity)
-        tests:
+        data_tests:
           - not_null
           - dbt_utils.expression_is_true:
               arguments:
@@ -88,7 +296,7 @@ models:
 
       - name: snapshot_timestamp
         description: Exact timestamp when snapshot was taken
-        tests:
+        data_tests:
           - not_null
 
       - name: source_type
@@ -96,7 +304,7 @@ models:
           Source of the metric data:
           - 'table': Direct table query using custom timestamp column
           - 'metadata': Information schema LAST_ALTERED metadata
-        tests:
+        data_tests:
           - not_null
           - accepted_values:
               arguments:
@@ -109,7 +317,7 @@ models:
 
       - name: _loaded_at
         description: ETL load timestamp
-        tests:
+        data_tests:
           - not_null
 
       - name: expected_staleness_mean

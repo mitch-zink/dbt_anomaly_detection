@@ -93,6 +93,6 @@ models:
       +enabled: false
       +tags: ["anomaly_detection", "testing", "examples"]
 
-tests:
+data_tests:
   dbt_anomaly_detection:
     +store_failures: true

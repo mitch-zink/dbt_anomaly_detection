@@ -1,4 +1,9 @@
-{%- test volume_anomaly(model, sensitivity="very_low", timestamp_column=none) -%}
+{%- test volume_anomaly(
+    model,
+    sensitivity="very_low",
+    timestamp_column=none,
+    training_period_days=30
+) -%}
     {#
     Generic test for volume anomaly detection.
 
@@ -12,6 +17,7 @@
         - model: The dbt model to monitor (automatically passed by dbt)
         - sensitivity: Sensitivity level (very_low, low, medium, high, very_high)
         - timestamp_column: Optional timestamp column for timestamp-based monitoring
+        - training_period_days: Lookback window (days) for the backfill/training baseline
 #}
     -- This test always passes - it's just a configuration marker
     -- The actual anomaly detection happens in volume_metrics_history
