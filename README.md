@@ -43,7 +43,7 @@ Add to your `packages.yml`:
 
 ```yaml
 packages:
-  - git: "https://github.com/YOUR_ORG/dbt_anomaly_detection.git"
+  - git: "https://github.com/mitch-zink/dbt_anomaly_detection.git"
     revision: 0.2.0  # Replace with latest release tag
 ```
 
